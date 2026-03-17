@@ -1,0 +1,31 @@
+# Configuración de insumos para reglas de cajeros multifuncionales
+
+directorios:
+  insumos: "insumos_excel"   # Carpeta donde están los archivos de insumo
+
+# Insumos requeridos (nombre lógico -> patrón del archivo con fecha DD_MM_YYYY)
+insumos:
+  gestion_erestrad:
+    patron: "gestion/gestion_{fecha}_erestrad.xlsx"   # insumos_excel/gestion/gestion_23_02_2026_erestrad.xlsx
+    descripcion: "Archivo de gestión - erestrad"
+    activo: true
+  consolidado_cajeros_cuadrados:
+    patron: "cuadrados/consolidado_cajeros_cuadrados_{fecha}.xlsx"   # insumos_excel/cuadrados/consolidado_..._23_02_2026.xlsx
+    descripcion: "Consolidado de cajeros cuadrados"
+    activo: true
+  # Archivo mensual: MM- ARQUEOS MF MES_AAAA.xlsx (ej: 02- ARQUEOS MF FEBRERO 2026.xlsx)
+  arqueos_mf:
+    patron_mes_anio: "{mm:02d}- ARQUEOS MF {mes_nombre} {yyyy}.xlsx"
+    descripcion: "Arqueos MF del mes (lectura y edicion)"
+    activo: true
+
+# Fecha de proceso (se puede sobreescribir; por defecto se usa la del día)
+proceso:
+  fecha: "23_02_2026"   # DD_MM_YYYY - dejar vacío o usar fecha actual
+
+# Conexión a base de datos NACIONAL (ODBC). Igual que reglas_dispensadores.
+base_datos:
+  usar_bd: true
+  servidor: "NACIONAL"
+  usuario_nal: "NJDFABRA"
+  clave_nal: "JESUS2026"
