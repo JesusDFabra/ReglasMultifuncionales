@@ -29,9 +29,12 @@ class CargadorConfig:
         return self._config
 
     def obtener_directorio_insumos(self) -> Path:
-        """Ruta absoluta a la carpeta de insumos."""
+        """Ruta absoluta a la carpeta de insumos. Si en config es ruta absoluta, se usa tal cual."""
         config = self.cargar()
         nombre_dir = config.get("directorios", {}).get("insumos", "insumos_excel")
+        path = Path(nombre_dir)
+        if path.is_absolute():
+            return path
         return PROYECTO_ROOT / nombre_dir
 
     def obtener_fecha_proceso(self) -> str:
@@ -48,6 +51,15 @@ class CargadorConfig:
         config = self.cargar()
         insumos = config.get("insumos", {})
         return {k: v for k, v in insumos.items() if v.get("activo", True)}
+
+    def obtener_umbrales_remanente(self) -> Dict[str, float]:
+        """Umbrales para reglas de Remanente (faltante_minimo_para_810291, faltante_limite_sobrantes)."""
+        config = self.cargar()
+        r = config.get("remanente", {})
+        return {
+            "faltante_minimo_para_810291": float(r.get("faltante_minimo_para_810291", 50_000_000)),
+            "faltante_limite_sobrantes": float(r.get("faltante_limite_sobrantes", 20_000_000)),
+        }
 
     def obtener_config_bd(self) -> Dict[str, Any]:
         """Configuración de base de datos (NACIONAL). usuario/clave desde usuario_nal y clave_nal."""

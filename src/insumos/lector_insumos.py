@@ -25,8 +25,18 @@ class LectorInsumos:
     def __init__(self, config: Optional[CargadorConfig] = None):
         self.config = config or CargadorConfig()
 
+    def _directorio_insumo(self, nombre_insumo: str):
+        """Directorio base para un insumo: insumo.directorio si existe, sino directorios.insumos."""
+        conf = self.config.cargar()
+        insumos = conf.get("insumos", {})
+        dir_insumo = insumos.get(nombre_insumo, {}).get("directorio")
+        if dir_insumo:
+            p = Path(dir_insumo)
+            return p if p.is_absolute() else (PROYECTO_ROOT / dir_insumo)
+        return self.config.obtener_directorio_insumos()
+
     def _ruta_archivo(self, nombre_insumo: str, fecha: Optional[str] = None) -> Path:
-        """Obtiene la ruta del archivo para un insumo y una fecha DD_MM_YYYY."""
+        """Obtiene la ruta del archivo para un insumo y una fecha DD_MM_YYYY (patron desde config)."""
         conf = self.config.cargar()
         insumos = conf.get("insumos", {})
         if nombre_insumo not in insumos:
@@ -34,7 +44,7 @@ class LectorInsumos:
         if fecha is None:
             fecha = self.config.obtener_fecha_proceso()
         patron = insumos[nombre_insumo].get("patron", "").replace("{fecha}", fecha)
-        directorio = self.config.obtener_directorio_insumos()
+        directorio = self._directorio_insumo(nombre_insumo)
         return directorio / patron
 
     def leer_gestion_erestrad(self, fecha: Optional[str] = None, hoja: Optional[str] = None) -> pd.DataFrame:
@@ -100,16 +110,24 @@ class LectorInsumos:
     # -------------------------------------------------------------------------
 
     def _ruta_arqueos_mf(self, mes: Optional[int] = None, anio: Optional[int] = None) -> Path:
-        """Ruta del archivo MM- ARQUEOS MF MES AÑO.xlsx. Si mes/anio no se pasan, usa mes/año actual."""
+        """Ruta del archivo de arqueos MF (patron_mes_anio desde config). Si mes/anio no se pasan, usa mes/año actual."""
         if mes is None or anio is None:
             hoy = datetime.now()
             mes = mes if mes is not None else hoy.month
             anio = anio if anio is not None else hoy.year
         if not (1 <= mes <= 12):
             raise ValueError(f"mes debe estar entre 1 y 12, recibido: {mes}")
-        mes_nombre = MESES_NOMBRE[mes - 1]
-        nombre = f"{mes:02d}- ARQUEOS MF {mes_nombre} {anio}.xlsx"
-        return self.config.obtener_directorio_insumos() / nombre
+        conf = self.config.cargar()
+        patron = conf.get("insumos", {}).get("arqueos_mf", {}).get(
+            "patron_mes_anio", "{mm:02d}- ARQUEOS MF {mes_nombre} {yyyy}.xlsx"
+        )
+        nombre = (
+            patron.replace("{mm:02d}", f"{mes:02d}")
+            .replace("{mes_nombre}", MESES_NOMBRE[mes - 1])
+            .replace("{yyyy}", str(anio))
+        )
+        directorio = self._directorio_insumo("arqueos_mf")
+        return directorio / nombre
 
     def leer_arqueos_mf(
         self,
@@ -137,6 +155,30 @@ class LectorInsumos:
         else:
             df = pd.read_excel(ruta, engine="openpyxl")
         logger.info("Filas: %d, columnas: %d", len(df), len(df.columns))
+        return df
+
+    def _ruta_historico_cuadre(self) -> Path:
+        """Ruta del archivo de historico cuadre (patron desde config)."""
+        conf = self.config.cargar()
+        insumos = conf.get("insumos", {})
+        patron = insumos.get("historico_cuadre_cajeros_sucursales", {}).get("patron", "HISTORICO_CUADRE_CAJEROS_SUCURSALES.xlsx")
+        directorio = self._directorio_insumo("historico_cuadre_cajeros_sucursales")
+        return directorio / patron
+
+    def leer_historico_cuadre_cajeros_sucursales(self, hoja: Optional[Union[str, int]] = None) -> pd.DataFrame:
+        """
+        Lee HISTORICO_CUADRE_CAJEROS_SUCURSALES.xlsx (tipo_registro, fecha_arqueo, cajero, etc.).
+        Se usa para obtener la fecha del ultimo arqueo cuando en ARQUEOS MF solo hay un registro del cajero.
+        """
+        ruta = self._ruta_historico_cuadre()
+        if not ruta.exists():
+            raise FileNotFoundError(f"No se encontro el archivo: {ruta}")
+        logger.info("Leyendo historico cuadre cajeros sucursales: %s", ruta)
+        if hoja is not None:
+            df = pd.read_excel(ruta, sheet_name=hoja, engine="openpyxl")
+        else:
+            df = pd.read_excel(ruta, engine="openpyxl")
+        logger.info("Historico: %d filas, %d columnas", len(df), len(df.columns))
         return df
 
     def guardar_arqueos_mf(

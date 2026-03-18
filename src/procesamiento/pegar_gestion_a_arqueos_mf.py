@@ -169,6 +169,51 @@ def _escribir_formula_diferencia_en_excel(ruta: Path, nombre_hoja: str = "DETALL
         logger.info("Fórmula Naturaleza escrita (Cuadrado/Faltante/Sobrante según Diferencia).")
 
 
+def _escribir_formulas_remanente_en_excel(
+    ruta: Path,
+    filas_formula: list,
+    nombre_hoja: str = "DETALLE MF",
+) -> None:
+    """
+    Escribe en la columna 'Remanente /Provisión /Ajustes' las fórmulas indicadas.
+    filas_formula: lista de (número_fila_excel, fórmula) donde fórmula es string tipo "=valor1-valor2+valor3".
+    """
+    if not filas_formula:
+        return
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.warning("openpyxl no disponible para escribir fórmulas Remanente")
+        return
+    wb = load_workbook(ruta)
+    if nombre_hoja not in wb.sheetnames:
+        nombre_hoja = wb.sheetnames[0]
+    sheet = wb[nombre_hoja]
+    headers = [sheet.cell(row=1, column=col).value for col in range(1, sheet.max_column + 1)]
+
+    def col_index(nombre: str) -> Optional[int]:
+        n = (nombre or "").strip().lower()
+        for i, h in enumerate(headers):
+            if (str(h or "").strip().lower() == n):
+                return i + 1
+        # Alias sin espacios
+        if "remanente" in n and "provision" in n:
+            for i, h in enumerate(headers):
+                if h and "remanente" in (str(h) or "").lower() and "provision" in (str(h) or "").lower():
+                    return i + 1
+        return None
+
+    idx_remanente = col_index("Remanente /Provisión /Ajustes") or col_index("Remanente/Provisión/Ajustes")
+    if idx_remanente is None:
+        logger.warning("No se encontró columna Remanente/Provisión/Ajustes para escribir fórmulas.")
+        return
+    for excel_row, formula in filas_formula:
+        if formula and str(formula).strip().startswith("="):
+            sheet.cell(row=excel_row, column=idx_remanente).value = formula
+    wb.save(ruta)
+    logger.info("Fórmulas Remanente escritas en %d celda(s).", len(filas_formula))
+
+
 def _rellenar_marca_desde_lista_mf(ruta: Path) -> None:
     """
     Rellena la columna Marca en la hoja DETALLE MF con el valor de la hoja Lista MF:
