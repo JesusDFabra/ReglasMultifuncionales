@@ -233,15 +233,13 @@ def calcular_remanente_para_cajero_cuadrado(
         "ratificado_cuadrado": False,
         "justificado_sobrantes": False,
         "gestion_manual": False,
+        "aclarar_diferencia": False,  # Faltante <= umbral sobrantes pero no se logró justificar con sobrantes
+        "sobrante_contabilizado_gerencia": False,  # Tras 770500+810291 queda sobrante; se graba texto cuenta 279510020
         "formula_remanente": None,
     }
     d0 = saldo_contable - (efectivo_arqueado + (dispensado_corte_arqueo or 0) - (recibido_corte_arqueo or 0))
     detalle["diferencia_sin_remanente"] = d0
     terminos = []  # términos para "=t1+t2-t3..."
-
-    _trace = nit == 5200
-    if _trace:
-        logger.info("[SEGUIMIENTO 5200] Paso 1 - d0=%.2f, umbral_810291=%.0f, umbral_sobrantes=%.0f", d0, lim_810291, lim_sobrantes)
 
     movs = consultar_movimientos_dia_arqueo(admin_bd, nit, anio, mes, dia)
     if movs is None:
@@ -333,12 +331,14 @@ def calcular_remanente_para_cajero_cuadrado(
         return (remanente, detalle)
 
     if diferencia <= 0:
+        detalle["sobrante_contabilizado_gerencia"] = True
         detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
         return (remanente, detalle)
 
     # Faltante restante: cruce con sobrantes según regla (exacto desde más reciente o desde más antiguo; orden salida: más antiguo a más reciente)
     faltante = diferencia
     if faltante <= lim_sobrantes:
+        detalle["aclarar_diferencia"] = True  # Por defecto; se pondrá False si se logra justificar con sobrantes
         vigentes = consultar_sobrantes_negativos_vigentes(
             admin_bd, nit, anio, mes, dia, fecha_desde=fecha_desde_sobrantes, incluir_dia_arqueo=incluir_dia_arqueo_sob
         )
@@ -363,6 +363,7 @@ def calcular_remanente_para_cajero_cuadrado(
                     sobrantes_utilizados.reverse()
                     detalle["remanente_sobrantes"] = running_sum
                     detalle["justificado_sobrantes"] = True
+                    detalle["aclarar_diferencia"] = False
                     detalle["valor_faltante"] = faltante
                     detalle["sobrantes_utilizados"] = sobrantes_utilizados
                     for u in sobrantes_utilizados:
@@ -393,6 +394,7 @@ def calcular_remanente_para_cajero_cuadrado(
             if running_sum >= faltante - tolerancia and sobrantes_utilizados:
                 detalle["remanente_sobrantes"] = running_sum
                 detalle["justificado_sobrantes"] = True
+                detalle["aclarar_diferencia"] = False
                 detalle["valor_faltante"] = faltante
                 detalle["sobrantes_utilizados"] = sobrantes_utilizados
                 for u in sobrantes_utilizados:
@@ -485,10 +487,7 @@ def procesar_cuadrados_fecha_descarga(
         recibido = _float_val(row, col_recibido)
         remanente_actual = _float_val(row, col_remanente)
         d0 = saldo - (efectivo + dispensado - recibido)
-        diferencia_actual = d0 - remanente_actual
         # Procesar tanto cuadrados como descuadrados: la misma lógica (770500 opuesto + sobrantes) aplica a todos
-        if cajero == 5200:
-            logger.info("[SEGUIMIENTO 5200] --- Inicio seguimiento cajero 5200 --- Fecha arqueo: %s, Fecha descarga: %s. Diferencia actual=%.2f. Se valida en BD (770500 + sobrantes).", fa, fecha_descarga, diferencia_actual)
         anio_a, mes_a, dia_a = fa.year, fa.month, fa.day
         fecha_desde_sob = obtener_fecha_ultimo_arqueo_para_sobrantes(
             cajero, fa, df, col_cajero, col_fecha_arqueo, lector, col_gestion=col_gestion
@@ -499,8 +498,6 @@ def procesar_cuadrados_fecha_descarga(
             fecha_desde_sobrantes=fecha_desde_sob,
         )
         if remanente_final is None:
-            if cajero == 5200:
-                logger.info("[SEGUIMIENTO 5200] Validación en BD devolvió None (error o sin movimientos). No se actualiza.")
             continue
         formula_remanente = detalle.get("formula_remanente")
         if formula_remanente:
@@ -512,8 +509,6 @@ def procesar_cuadrados_fecha_descarga(
         # No tocar Gestión a Realizar si ya tiene valor (no sobrescribir)
         valor_gestion_actual = df.at[idx, col_gestion]
         gestion_no_vacia = valor_gestion_actual is not None and not (isinstance(valor_gestion_actual, float) and pd.isna(valor_gestion_actual)) and str(valor_gestion_actual).strip() != ""
-        if cajero == 5200:
-            logger.info("[SEGUIMIENTO 5200] --- Escritura en Gestión a Realizar --- Rama: %s", "ratificado_cuadrado" if detalle.get("ratificado_cuadrado") else ("justificado_sobrantes (CRUCE)" if detalle.get("justificado_sobrantes") else ("gestion_manual" if detalle.get("gestion_manual") else "remanente actualizado (banco)")))
         if gestion_no_vacia:
             logger.info("Cajero %s (F. arqueo %s): Gestión a Realizar ya tiene valor; no se sobrescribe. Remanente actualizado.", cajero, fa)
         elif detalle.get("gestion_manual"):
@@ -539,6 +534,13 @@ def procesar_cuadrados_fecha_descarga(
             df.at[idx, col_gestion] = texto_gestion
             logger.info("Cajero %s (F. arqueo %s): faltante justificado con sobrantes, remanente %.2f (banco %.2f + sobrantes %.2f). Gestión: %s",
                         cajero, fa, remanente_final, detalle.get("remanente_banco", 0), detalle.get("remanente_sobrantes", 0), texto_gestion[:60])
+        elif detalle.get("aclarar_diferencia"):
+            df.at[idx, col_gestion] = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+            logger.info("Cajero %s (F. arqueo %s): faltante no justificado con sobrantes; aclarar diferencia y repetir arqueo.", cajero, fa)
+        elif detalle.get("sobrante_contabilizado_gerencia"):
+            texto_sobrante = f"La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada a la cuenta de sobrantes 279510020 el {fecha_gestion_str}"
+            df.at[idx, col_gestion] = texto_sobrante
+            logger.info("Cajero %s (F. arqueo %s): sobrante tras validación 770500+810291; Gestión: cuenta sobrantes %s.", cajero, fa, fecha_gestion_str)
         else:
             logger.info("Cajero %s (F. arqueo %s): remanente actualizado %.2f (banco %.2f).", cajero, fa, remanente_final, detalle.get("remanente_banco", 0))
 
