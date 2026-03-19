@@ -52,13 +52,14 @@ class CargadorConfig:
         insumos = config.get("insumos", {})
         return {k: v for k, v in insumos.items() if v.get("activo", True)}
 
-    def obtener_umbrales_remanente(self) -> Dict[str, float]:
-        """Umbrales para reglas de Remanente (faltante_minimo_para_810291, faltante_limite_sobrantes)."""
+    def obtener_umbrales_remanente(self) -> Dict[str, Any]:
+        """Umbrales y opciones para reglas de Remanente (faltante_minimo_para_810291, faltante_limite_sobrantes, sobrantes_incluir_dia_arqueo)."""
         config = self.cargar()
         r = config.get("remanente", {})
         return {
             "faltante_minimo_para_810291": float(r.get("faltante_minimo_para_810291", 50_000_000)),
             "faltante_limite_sobrantes": float(r.get("faltante_limite_sobrantes", 20_000_000)),
+            "sobrantes_incluir_dia_arqueo": bool(r.get("sobrantes_incluir_dia_arqueo", True)),
         }
 
     def obtener_config_bd(self) -> Dict[str, Any]:

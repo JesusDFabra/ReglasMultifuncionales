@@ -51,6 +51,7 @@ def _main():
     col_dispensado = _buscar_columna(df, ["dispensado_corte_arqueo"])
     col_recibido = _buscar_columna(df, ["recibido_corte_arqueo"])
     col_remanente = _buscar_columna(df, ["Remanente /Provisión /Ajustes", "Remanente/Provisión/Ajustes"])
+    col_gestion = _buscar_columna(df, ["Gestión a Realizar", "Gestion a Realizar"]) or "Gestión a Realizar"
 
     # Buscar fila del cajero con esa fecha arqueo
     row = None
@@ -122,18 +123,21 @@ def _main():
         print(f"  -> Suma VALOR en BD: {total_810291_bd:,.0f}  (aplicamos signo contrario)")
         print()
 
+        umbrales_rem = config.obtener_umbrales_remanente()
+        incluir_dia_arqueo_sob = umbrales_rem.get("sobrantes_incluir_dia_arqueo", True)
         fecha_desde_sob = obtener_fecha_ultimo_arqueo_para_sobrantes(
-            args.cajero, fecha_arqueo, df, col_cajero, col_fa, lector
+            args.cajero, fecha_arqueo, df, col_cajero, col_fa, lector, col_gestion=col_gestion
         )
-        fecha_hasta_sob = fecha_arqueo - timedelta(days=1)
+        fecha_hasta_sob = fecha_arqueo if incluir_dia_arqueo_sob else (fecha_arqueo - timedelta(days=1))
         if fecha_desde_sob is not None:
-            print("RANGO CONSULTA SOBRANTES (desde arqueo anterior hasta arqueo actual - 1):")
+            hasta_texto = "dia del arqueo actual" if incluir_dia_arqueo_sob else "dia antes del arqueo actual"
+            print("RANGO CONSULTA SOBRANTES (desde arqueo anterior hasta " + hasta_texto + "):")
             print("-" * 40)
             print(f"  Desde: {fecha_desde_sob} (arqueo anterior)")
-            print(f"  Hasta: {fecha_hasta_sob} (dia antes del arqueo actual)")
+            print(f"  Hasta: {fecha_hasta_sob} (" + hasta_texto + ")")
             print()
         else:
-            print("RANGO SOBRANTES: fallback (dia 1 del mes hasta dia antes del arqueo)")
+            print("RANGO SOBRANTES: fallback (dia 1 del mes hasta " + ("dia arqueo" if incluir_dia_arqueo_sob else "dia antes del arqueo") + ")")
             print()
 
         remanente_final, detalle = calcular_remanente_para_cajero_cuadrado(
@@ -163,7 +167,7 @@ def _main():
         faltante = (detalle.get("diferencia_sin_remanente") or 0) - (remanente_final or 0)
         if remanente_final is not None and faltante > 0 and faltante <= 20_000_000 and not detalle.get("justificado_sobrantes"):
             vigentes = consultar_sobrantes_negativos_vigentes(
-                admin, args.cajero, anio_a, mes_a, dia_a, fecha_desde=fecha_desde_sob
+                admin, args.cajero, anio_a, mes_a, dia_a, fecha_desde=fecha_desde_sob, incluir_dia_arqueo=incluir_dia_arqueo_sob
             )
             print()
             print("CONSULTA SOBRANTES (cuenta 279510020):")

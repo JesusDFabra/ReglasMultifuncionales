@@ -34,7 +34,9 @@ remanente:
   # Faltante mínimo para aplicar ajustes 810291 (sucursal): solo si faltante > este valor se aplica.
   faltante_minimo_para_810291: 50000000   # 50M
   # Faltante máximo para ir a cuenta sobrantes: si faltante <= este valor, se busca en sobrantes; si > y no hay más 810291, Gestión manual.
-  faltante_limite_sobrantes: 20000000     # 20M
+  faltante_limite_sobrantes: 25000000     # 25M
+  # Rango sobrantes: si true, "hasta" = dia del arqueo; si false, "hasta" = dia anterior al arqueo.
+  sobrantes_incluir_dia_arqueo: true
 
 # Conexión a base de datos NACIONAL (ODBC). Igual que reglas_dispensadores.
 base_datos:
