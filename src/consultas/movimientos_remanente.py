@@ -71,19 +71,20 @@ def consultar_sobrantes_negativos_vigentes(
     incluir_dia_arqueo: bool = True,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    En cuenta de sobrantes (279510020): valores negativos vigentes.
+    En cuenta de sobrantes (279510020): movimientos de sobrante "vigente" para cruzar.
 
-    Significado en la cuenta 279510020:
-    - VALOR negativo: sobrante contabilizado (hubo exceso en cajero, se registra como sobrante vigente
-      para poder "cruzar" luego con un faltante del mismo monto).
-    - VALOR positivo: reversión o cierre de sobrante; al encontrar el primer positivo hacia atrás
-      se deja de considerar sobrantes vigentes (ese bloque de negativos ya fue revertido).
+    Regla por `NUMDOC` (según ajuste pedido):
+    - Se consultan todos los movimientos de la cuenta en el rango [fecha_inicio, fecha_fin].
+    - Para cada `NUMDOC`, se calcula el neto: `sum(VALOR)` de todos los registros con ese `NUMDOC`.
+    - Si el neto es negativo (< 0), ese monto neto es el "sobrante vigente" disponible para cruces.
+    - Si el neto es positivo o 0, ese `NUMDOC` NO se considera para ningún cruce.
 
-    Rango de busqueda:
-    - Hasta: dia del arqueo si incluir_dia_arqueo=True; si no, un dia antes del arqueo.
-    - Desde: si se pasa fecha_desde (fecha del ultimo arqueo del cajero), se usa esa fecha;
-      si no, fallback: dia 1 del mes de (arqueo - 1 dia).
-    Devuelve el primer bloque de movimientos negativos hasta encontrar un positivo.
+    Además:
+    - La función devuelve 1 registro sintético por cada `NUMDOC` vigente, con:
+      - `VALOR`: neto negativo calculado
+      - `FECHA`: la FECHA del movimiento negativo más reciente dentro de ese `NUMDOC`
+        (se usa para ordenar y, por tanto, para el criterio de "desde más reciente").
+    - Se mantiene el retorno ordenado por `FECHA DESC` (más reciente primero).
     """
     fecha_arqueo_date = date(anio, mes, dia)
     fecha_hasta = fecha_arqueo_date if incluir_dia_arqueo else (fecha_arqueo_date - timedelta(days=1))
@@ -102,18 +103,80 @@ def consultar_sobrantes_negativos_vigentes(
       AND (ANOELB*10000+MESELB*100+DIAELB) BETWEEN {fecha_inicio} AND {fecha_fin}
     ORDER BY FECHA DESC
     """
+    def _norm_numdoc(v):
+        if v is None:
+            return None
+        try:
+            return int(float(v))
+        except Exception:
+            return v
+
     try:
         df = admin_bd.consultar(consulta, mantener_conexion=True)
         if df is None or df.empty:
             return []
-        # Primer bloque de negativos desde el más reciente hasta encontrar un positivo
-        vigentes = []
-        for _, row in df.iterrows():
-            v = float(row.get("VALOR", 0) or 0)
-            if v < 0:
-                vigentes.append(row.to_dict())
-            else:
-                break  # primer positivo, nos detenemos
+        if "VALOR" not in df.columns or "NUMDOC" not in df.columns or "FECHA" not in df.columns:
+            return []
+
+        df = df.copy()
+        df["VALOR"] = df["VALOR"].apply(lambda x: float(x or 0))
+        df["NUMDOC_NORM"] = df["NUMDOC"].apply(_norm_numdoc)
+
+        # Para cada NUMDOC:
+        # - los VALOR negativos representan "sobrante" disponible por tramos (chunks) con su FECHA
+        # - los VALOR positivos (reversión) consumen primero el chunk más antiguo del mismo NUMDOC (FIFO)
+        # - si aparece un positivo sin sobrante previo del mismo NUMDOC, se ignora (no se cruza)
+        # - al final, retornamos los chunks negativos que quedaron con saldo (neto negativo por NUMDOC)
+        vigentes: List[Dict[str, Any]] = []
+        for numdoc, sub in df.groupby("NUMDOC_NORM", dropna=False):
+            # Orden cronológico para aplicar FIFO (más viejo -> más nuevo)
+            sub = sub.copy()
+            sub["_FECHA_INT"] = sub["FECHA"].apply(lambda x: int(float(x or 0)))
+            sub = sub.sort_values(by="_FECHA_INT", ascending=True)
+
+            cola_chunks: List[Dict[str, Any]] = []  # cada chunk: {FECHA_INT, saldo_abs, NROCMP}
+
+            for _, row in sub.iterrows():
+                v = float(row.get("VALOR", 0) or 0)
+                if v == 0:
+                    continue
+                fecha_int = int(float(row.get("FECHA", 0) or 0))
+
+                if v < 0:
+                    saldo_abs = abs(v)
+                    nroc = None
+                    if "NROCMP" in row.index:
+                        try:
+                            nroc = float(row.get("NROCMP", 0) or 0)
+                        except Exception:
+                            nroc = row.get("NROCMP")
+                    cola_chunks.append({"FECHA": fecha_int, "saldo_abs": saldo_abs, "NROCMP": nroc})
+                else:
+                    # Positivo: consume saldo de chunks más antiguos (mismo NUMDOC)
+                    reverso = v
+                    while reverso > 0 and cola_chunks:
+                        primero = cola_chunks[0]
+                        tomar = min(primero["saldo_abs"], reverso)
+                        primero["saldo_abs"] -= tomar
+                        reverso -= tomar
+                        if primero["saldo_abs"] <= 0:
+                            cola_chunks.pop(0)
+
+            # Devolver solo lo que quedó disponible (saldo por chunk)
+            for ch in cola_chunks:
+                if ch.get("saldo_abs", 0) <= 0:
+                    continue
+                vigentes.append(
+                    {
+                        "FECHA": ch["FECHA"],
+                        "VALOR": -float(ch["saldo_abs"]),
+                        "NROCMP": ch.get("NROCMP"),
+                        "NUMDOC": numdoc,
+                    }
+                )
+
+        # Orden salida: más reciente -> más antiguo
+        vigentes.sort(key=lambda x: int(float(x.get("FECHA") or 0)), reverse=True)
         return vigentes
     except Exception as e:
         logger.error("Error al consultar sobrantes negativos vigentes: %s", e)
@@ -345,63 +408,125 @@ def calcular_remanente_para_cajero_cuadrado(
         if vigentes is not None:
             vigentes = [m for m in vigentes if float(m.get("VALOR", 0) or 0) < 0]
             fecha_arqueo_int = anio * 10000 + mes * 100 + dia
-            en_dia_arqueo = sum(1 for m in vigentes if m.get("FECHA") is not None and int(float(m.get("FECHA"))) == fecha_arqueo_int)
+            # "DIARIO" se decide por NUMDOC (YYYYMMDD), no por la fecha de grabación (FECHA/ANOELB/MESELB/DIAELB)
+            en_dia_arqueo = sum(
+                1
+                for m in vigentes
+                if m.get("NUMDOC") is not None and int(float(m.get("NUMDOC"))) == fecha_arqueo_int
+            )
             if en_dia_arqueo > 1:
                 detalle["gestion_manual"] = True
                 detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
                 return (remanente, detalle)
-            sobrantes_utilizados = []
-            running_sum = 0.0
-            # Estrategia 1: sumar desde el más reciente al más antiguo; si en algún momento la suma es exacta, usar ese conjunto (orden salida: antiguo → reciente)
-            for m in vigentes:
-                amount = abs(float(m.get("VALOR", 0) or 0))
-                if amount <= 0:
-                    continue
-                running_sum += amount
-                sobrantes_utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": amount})
-                if abs(running_sum - faltante) <= tolerancia:
-                    sobrantes_utilizados.reverse()
+            # Etapa 1/2 y orden de consumo dependen del "DIARIO" (NUMDOC = YYYYMMDD)
+            # Para desempate dentro de un mismo NUMDOC, consumimos por fecha de grabación más antigua a más reciente.
+            vigentes_asc = sorted(
+                vigentes,
+                key=lambda x: (
+                    int(float(x.get("NUMDOC") or 0)),
+                    int(float(x.get("FECHA") or 0)),
+                ),
+            )
+
+            penultimo_int: Optional[int] = None
+            if fecha_desde_sobrantes is not None:
+                penultimo_int = (
+                    fecha_desde_sobrantes.year * 10000
+                    + fecha_desde_sobrantes.month * 100
+                    + fecha_desde_sobrantes.day
+                )
+
+            if penultimo_int is None:
+                vigentes_after_penultimo = vigentes_asc
+                vigentes_penultimo = []
+            else:
+                vigentes_after_penultimo = [m for m in vigentes_asc if int(float(m.get("NUMDOC") or 0)) > penultimo_int]
+                vigentes_penultimo = [m for m in vigentes_asc if int(float(m.get("NUMDOC") or 0)) == penultimo_int]
+
+            sum_after = sum(abs(float(m.get("VALOR", 0) or 0)) for m in vigentes_after_penultimo)
+
+            def _intentar_cruce(subset, objetivo: float):
+                """
+                Consume en orden (más antiguo -> más reciente) hasta llegar al objetivo.
+                Permite consumo parcial del último "chunk" si no alcanza entero.
+                """
+                running_sum = 0.0
+                utilizados = []
+                for m in subset:
+                    amount = abs(float(m.get("VALOR", 0) or 0))
+                    if amount <= 0:
+                        continue
+                    need = objetivo - running_sum
+                    if need <= tolerancia:
+                        break
+                    use_amount = min(amount, need)
+                    running_sum += use_amount
+                    utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": use_amount})
+                    if abs(running_sum - objetivo) <= tolerancia:
+                        return running_sum, utilizados
+                return running_sum, utilizados
+
+            # Etapa 1: si faltante <= suma disponible (por DIARIO) después del penúltimo arqueo,
+            # cruzar únicamente con los sobrantes con FECHA > penúltimo.
+            if faltante <= sum_after + tolerancia:
+                running_sum, utilizados = _intentar_cruce(vigentes_after_penultimo, faltante)
+                if abs(running_sum - faltante) <= tolerancia and utilizados:
                     detalle["remanente_sobrantes"] = running_sum
                     detalle["justificado_sobrantes"] = True
                     detalle["aclarar_diferencia"] = False
                     detalle["valor_faltante"] = faltante
-                    detalle["sobrantes_utilizados"] = sobrantes_utilizados
-                    for u in sobrantes_utilizados:
+                    detalle["sobrantes_utilizados"] = utilizados
+                    for u in utilizados:
                         terminos.append(_term_formula(u["valor"]))
                         remanente += u["valor"]
-                    if sobrantes_utilizados:
-                        detalle["fecha_sobrante_str"] = sobrantes_utilizados[-1].get("fecha_str", "")
+                    if utilizados:
+                        detalle["fecha_sobrante_str"] = utilizados[-1].get("fecha_str", "")
                     detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
                     return (remanente, detalle)
-                if running_sum > faltante + tolerancia:
-                    break
-            # Estrategia 2: tomar desde el más antiguo al más reciente (puede ser parte de un movimiento)
-            sobrantes_utilizados = []
-            running_sum = 0.0
-            vigentes_asc = sorted(vigentes, key=lambda x: int(float(x.get("FECHA") or 0)))
-            for m in vigentes_asc:
+
+            # Etapa 2: si faltante > suma disponible después del penúltimo,
+            # cruzar con todo lo posterior y luego con FECHA == penúltimo (solo para el saldo restante).
+            after_utilizados = []
+            sum_after_utilizada = 0.0
+            for m in vigentes_after_penultimo:
                 amount = abs(float(m.get("VALOR", 0) or 0))
                 if amount <= 0:
                     continue
-                need = faltante - running_sum
-                if need <= tolerancia:
-                    break
-                use_amount = min(amount, need)
-                running_sum += use_amount
-                sobrantes_utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": use_amount})
-                if running_sum >= faltante - tolerancia:
-                    break
-            if running_sum >= faltante - tolerancia and sobrantes_utilizados:
-                detalle["remanente_sobrantes"] = running_sum
+                sum_after_utilizada += amount
+                after_utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": amount})
+
+            remaining = faltante - sum_after_utilizada
+            if remaining < -tolerancia:
+                remaining = 0.0
+
+            if remaining <= tolerancia:
+                total_utilizados = after_utilizados
+                if total_utilizados:
+                    detalle["remanente_sobrantes"] = sum_after_utilizada
+                    detalle["justificado_sobrantes"] = True
+                    detalle["aclarar_diferencia"] = False
+                    detalle["valor_faltante"] = faltante
+                    detalle["sobrantes_utilizados"] = total_utilizados
+                    for u in total_utilizados:
+                        terminos.append(_term_formula(u["valor"]))
+                        remanente += u["valor"]
+                    detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+                    return (remanente, detalle)
+
+            running_sum_pen, utilizados_pen = _intentar_cruce(vigentes_penultimo, remaining)
+            total_sum = sum_after_utilizada + running_sum_pen
+            if abs(total_sum - faltante) <= tolerancia and after_utilizados is not None and utilizados_pen:
+                total_utilizados = after_utilizados + utilizados_pen
+                detalle["remanente_sobrantes"] = total_sum
                 detalle["justificado_sobrantes"] = True
                 detalle["aclarar_diferencia"] = False
                 detalle["valor_faltante"] = faltante
-                detalle["sobrantes_utilizados"] = sobrantes_utilizados
-                for u in sobrantes_utilizados:
+                detalle["sobrantes_utilizados"] = total_utilizados
+                for u in total_utilizados:
                     terminos.append(_term_formula(u["valor"]))
                     remanente += u["valor"]
-                if sobrantes_utilizados:
-                    detalle["fecha_sobrante_str"] = sobrantes_utilizados[-1].get("fecha_str", "")
+                if total_utilizados:
+                    detalle["fecha_sobrante_str"] = total_utilizados[-1].get("fecha_str", "")
                 detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
                 return (remanente, detalle)
     else:
@@ -489,8 +614,9 @@ def procesar_cuadrados_fecha_descarga(
         d0 = saldo - (efectivo + dispensado - recibido)
         # Procesar tanto cuadrados como descuadrados: la misma lógica (770500 opuesto + sobrantes) aplica a todos
         anio_a, mes_a, dia_a = fa.year, fa.month, fa.day
-        fecha_desde_sob = obtener_fecha_ultimo_arqueo_para_sobrantes(
-            cajero, fa, df, col_cajero, col_fecha_arqueo, lector, col_gestion=col_gestion
+        # El rango de sobrantes va desde el penúltimo arqueo del cajero hasta el último arqueo (incluyendo el día del arqueo actual).
+        fecha_desde_sob = obtener_fecha_penultimo_arqueo(
+            cajero, fa, df, col_cajero, col_fecha_arqueo, lector
         )
         remanente_final, detalle = calcular_remanente_para_cajero_cuadrado(
             admin_bd, cajero, anio_a, mes_a, dia_a,
@@ -535,8 +661,38 @@ def procesar_cuadrados_fecha_descarga(
             logger.info("Cajero %s (F. arqueo %s): faltante justificado con sobrantes, remanente %.2f (banco %.2f + sobrantes %.2f). Gestión: %s",
                         cajero, fa, remanente_final, detalle.get("remanente_banco", 0), detalle.get("remanente_sobrantes", 0), texto_gestion[:60])
         elif detalle.get("aclarar_diferencia"):
-            df.at[idx, col_gestion] = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
-            logger.info("Cajero %s (F. arqueo %s): faltante no justificado con sobrantes; aclarar diferencia y repetir arqueo.", cajero, fa)
+            # Evitar repetir arqueo 2 veces seguidas: revisar si el arqueo anterior del mismo cajero tuvo la misma calificación.
+            gestion_prev = ""
+            fa_prev = None
+            for _, rprev in df.iterrows():
+                if pd.isna(rprev.get(col_cajero)):
+                    continue
+                try:
+                    c_prev = int(float(rprev.get(col_cajero)))
+                except (ValueError, TypeError):
+                    continue
+                if c_prev != cajero:
+                    continue
+                fa_candidate = _valor_a_fecha(rprev.get(col_fecha_arqueo))
+                if fa_candidate is None or fa_candidate >= fa:
+                    continue
+                if fa_prev is None or fa_candidate > fa_prev:
+                    fa_prev = fa_candidate
+                    gestion_prev = str(rprev.get(col_gestion) or "").strip()
+
+            gestion_prev_norm = gestion_prev.strip().upper()
+            repetir_prev = any(gestion_prev_norm == g.strip().upper() for g in GESTION_REPETIR_ARQUEO_EXACTAS)
+            if repetir_prev:
+                texto_reemplazo = (
+                    "La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada "
+                    "a la cuenta de faltantes 168710093 el " + fecha_gestion_str + ", esta diferencia ingresa a proceso "
+                    "de investigación en el área para identificar a que corresponde."
+                )
+                df.at[idx, col_gestion] = texto_reemplazo
+                logger.info("Cajero %s (F. arqueo %s): 2da repetición consecutiva; gestionar como faltantes.", cajero, fa)
+            else:
+                df.at[idx, col_gestion] = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+                logger.info("Cajero %s (F. arqueo %s): faltante no justificado con sobrantes; aclarar diferencia y repetir arqueo.", cajero, fa)
         elif detalle.get("sobrante_contabilizado_gerencia"):
             texto_sobrante = f"La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada a la cuenta de sobrantes 279510020 el {fecha_gestion_str}"
             df.at[idx, col_gestion] = texto_sobrante
@@ -598,6 +754,41 @@ def _valor_a_fecha(val) -> Optional[date]:
 
 # Textos en "Gestión a Realizar" que indican que el "Desde" de sobrantes debe retroceder un arqueo más.
 GESTION_REPETIR_ARQUEO_EXACTAS = ("REPITIERON ARQUEO", "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO")
+
+
+def obtener_fecha_penultimo_arqueo(
+    cajero: int,
+    fecha_arqueo_actual: date,
+    df_arqueos_mf: pd.DataFrame,
+    col_cajero: str,
+    col_fecha_arqueo: str,
+    lector=None,
+) -> Optional[date]:
+    """
+    Fecha del arqueo inmediatamente anterior (penúltimo) para un cajero.
+
+    Se basa en ARQUEOS MF: buscar el máximo `fecha_arqueo` < `fecha_arqueo_actual`.
+    Si no existe en ARQUEOS MF, se usa historico cuadre (si lector está disponible).
+    """
+    candidatos: list[date] = []
+    for _, row in df_arqueos_mf.iterrows():
+        try:
+            c = int(float(row[col_cajero]))
+        except (ValueError, TypeError):
+            continue
+        if c != cajero:
+            continue
+        fa = _valor_a_fecha(row.get(col_fecha_arqueo))
+        if fa is not None and fa < fecha_arqueo_actual:
+            candidatos.append(fa)
+
+    if candidatos:
+        return max(candidatos)
+
+    if lector is None:
+        return None
+
+    return _fecha_ultimo_arqueo_desde_historico(lector, cajero, fecha_limite=fecha_arqueo_actual)
 
 
 def obtener_fecha_ultimo_arqueo_para_sobrantes(
