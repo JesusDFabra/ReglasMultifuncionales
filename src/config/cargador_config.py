@@ -59,7 +59,26 @@ class CargadorConfig:
         return {
             "faltante_minimo_para_810291": float(r.get("faltante_minimo_para_810291", 50_000_000)),
             "faltante_limite_sobrantes": float(r.get("faltante_limite_sobrantes", 20_000_000)),
+            "faltante_maximo_grabar_cuenta_faltantes": float(r.get("faltante_maximo_grabar_cuenta_faltantes", 20_000)),
             "sobrantes_incluir_dia_arqueo": bool(r.get("sobrantes_incluir_dia_arqueo", True)),
+        }
+
+    def obtener_regla_diario_sobrantes(self) -> Dict[str, Any]:
+        """
+        Regla para filas DIARIO con sobrantes extremos en el archivo de gestion.
+
+        Campos:
+        - activo: habilita/deshabilita la regla.
+        - limite_sobrante_negativo: umbral alto (en pesos) para aplicar cuando abs(sobrantes) >= umbral.
+        - limite_sobrante_medio_minimo: umbral mínimo del tramo medio (en pesos), aplicado cuando:
+          limite_sobrante_medio_minimo <= abs(sobrantes) < limite_sobrante_negativo.
+        """
+        config = self.cargar()
+        regla = config.get("reglas_gestion", {}).get("diario_sobrantes_extremos", {})
+        return {
+            "activo": bool(regla.get("activo", False)),
+            "limite_sobrante_negativo": float(regla.get("limite_sobrante_negativo", 1_000_000_000)),
+            "limite_sobrante_medio_minimo": float(regla.get("limite_sobrante_medio_minimo", 50_000_000)),
         }
 
     def obtener_config_bd(self) -> Dict[str, Any]:

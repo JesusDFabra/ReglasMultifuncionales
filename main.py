@@ -43,6 +43,36 @@ def _fecha_str_a_date(fecha: str) -> date:
     return date(a, m, d)
 
 
+def _existen_registros_fecha_descarga_hoy(lector: LectorInsumos, fecha: str, mes: int, anio: int, hoja) -> bool:
+    """
+    Verifica si ARQUEOS MF ya contiene filas con "Fecha descarga arqueo" igual a la fecha indicada.
+    Si existen, se debe omitir el copiado de insumos (gestión/consolidado).
+    """
+    import pandas as pd
+
+    fecha_obj = _fecha_str_a_date(fecha)
+    df_arq = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
+
+    col_fecha_descarga = None
+    for c in df_arq.columns:
+        n = str(c).strip().lower()
+        if n in ("fecha descarga arqueo", "fecha_descarga_arqueo", "fecha descarga arqueo "):
+            col_fecha_descarga = c
+            break
+    if col_fecha_descarga is None:
+        logger.warning("No se encontró columna 'Fecha descarga arqueo' en ARQUEOS MF; se continuará con copiado.")
+        return False
+
+    fechas = pd.to_datetime(df_arq[col_fecha_descarga], errors="coerce").dt.date
+    existe = bool((fechas == fecha_obj).any())
+    if existe:
+        logger.info(
+            "ARQUEOS MF ya tiene registros con Fecha descarga arqueo = %s. Se omite copiado de gestión y consolidado.",
+            fecha,
+        )
+    return existe
+
+
 def main(
     fecha: str = None,
     solo_leer: bool = False,
@@ -138,6 +168,7 @@ def main(
 
     # Por defecto ejecutar pegado (gestión y consolidado) salvo que sea solo_leer
     ejecutar_pegar = not solo_leer
+    omitir_copiado_por_fecha_existente = False
     if ejecutar_pegar:
         if pegar_gestion is None and pegar_consolidado is None:
             pegar_gestion, pegar_consolidado = True, True
@@ -146,10 +177,16 @@ def main(
                 pegar_gestion = False
             if pegar_consolidado is None:
                 pegar_consolidado = False
+
+        # Nueva regla: si ya existen filas con Fecha descarga arqueo = fecha_usar, no volver a copiar.
+        if _existen_registros_fecha_descarga_hoy(lector, fecha_usar, mes_usar, anio_usar, hoja):
+            pegar_gestion = False
+            pegar_consolidado = False
+            omitir_copiado_por_fecha_existente = True
     else:
         pegar_gestion = pegar_consolidado = False
 
-    if pegar_gestion or pegar_consolidado:
+    if pegar_gestion or pegar_consolidado or omitir_copiado_por_fecha_existente:
         if pegar_gestion:
             df_gestion = lector.leer_gestion_erestrad(fecha=fecha_usar)
             pegar_gestion_a_arqueos_mf(
@@ -171,6 +208,8 @@ def main(
                 fecha_proceso=fecha_usar,
             )
             logger.info("Pegado de consolidado a ARQUEOS MF completado (mes=%s, anio=%s).", mes_usar, anio_usar)
+        if omitir_copiado_por_fecha_existente:
+            logger.info("Copiado omitido por regla de fecha ya existente; se continúa con el resto del proceso.")
         # Aplicar reglas: cuadrados (770500 día arqueo, sobrantes si faltante, ratificar, texto Gestión a Realizar)
         admin = crear_admin_nacional_desde_config(config)
         if admin:
@@ -185,6 +224,37 @@ def main(
                 admin.desconectar()
         else:
             logger.warning("BD no configurada; no se aplicaron reglas de cuadrados (770500/sobrantes).")
+
+        # NUEVA REGLA: en gestión, grabar sobrante para cajeros cuyo ARQUEOS MF indique
+        # contabilización centralizada en cuenta 279510020.
+        try:
+            n_grabar = lector.aplicar_regla_grabar_sobrante_desde_arqueos_mf(
+                fecha=fecha_usar,
+                hoja_gestion=None,
+                hoja_arqueos_mf=0,
+            )
+            if n_grabar:
+                logger.info("Regla grabar sobrante aplicada: %d registro(s) modificados en gestión.", n_grabar)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla grabar sobrante en gestión: %s", e)
+
+        # NUEVA REGLA: sincronizar Gestión (ARQUEO) con "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+        try:
+            modificados = lector.aplicar_regla_arqueo_espera_aclarar_sucursal(fecha=fecha_usar, hoja_gestion=None, hoja_arqueos_mf=0)
+            if modificados:
+                logger.info("Regla ARQUEO aclarar/sucursal aplicada: %d registro(s) modificados en gestión.", modificados)
+        except Exception as e:
+            logger.warning("No se pudo aplicar la regla ARQUEO aclarar/sucursal en gestión: %s", e)
+
+        # Prioridad: si ARQUEOS MF marca cajero cuadrado (fecha descarga = hoy), observaciones en gestión = CUADRADO EN ARQUEO.
+        try:
+            n_cuad = lector.aplicar_observaciones_cuadrado_desde_arqueos_mf(
+                fecha=fecha_usar, hoja_gestion=None, hoja_arqueos_mf=0
+            )
+            if n_cuad:
+                logger.info("Regla observaciones CUADRADO EN ARQUEO aplicada: %d fila(s) en gestión.", n_cuad)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla CUADRADO EN ARQUEO en gestión: %s", e)
         return
 
     try:

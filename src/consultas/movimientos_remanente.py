@@ -121,59 +121,44 @@ def consultar_sobrantes_negativos_vigentes(
         df = df.copy()
         df["VALOR"] = df["VALOR"].apply(lambda x: float(x or 0))
         df["NUMDOC_NORM"] = df["NUMDOC"].apply(_norm_numdoc)
+        df["FECHA_INT"] = df["FECHA"].apply(lambda x: int(float(x or 0)))
 
-        # Para cada NUMDOC:
-        # - los VALOR negativos representan "sobrante" disponible por tramos (chunks) con su FECHA
-        # - los VALOR positivos (reversión) consumen primero el chunk más antiguo del mismo NUMDOC (FIFO)
-        # - si aparece un positivo sin sobrante previo del mismo NUMDOC, se ignora (no se cruza)
-        # - al final, retornamos los chunks negativos que quedaron con saldo (neto negativo por NUMDOC)
+        # Nueva regla de vigencia solicitada:
+        # - Se suma VALOR por NUMDOC
+        # - Si el neto es negativo (< 0), el sobrante sigue "activo"
+        # - Si el neto es >= 0, se considera cancelado/no vigente
+        #
+        # Para la FECHA de salida se conserva la del movimiento NEGATIVO más reciente
+        # dentro del NUMDOC (si no existe, se usa la más reciente general como fallback).
         vigentes: List[Dict[str, Any]] = []
         for numdoc, sub in df.groupby("NUMDOC_NORM", dropna=False):
-            # Orden cronológico para aplicar FIFO (más viejo -> más nuevo)
-            sub = sub.copy()
-            sub["_FECHA_INT"] = sub["FECHA"].apply(lambda x: int(float(x or 0)))
-            sub = sub.sort_values(by="_FECHA_INT", ascending=True)
+            saldo_neto = float(sub["VALOR"].sum())
+            if saldo_neto >= 0:
+                continue
 
-            cola_chunks: List[Dict[str, Any]] = []  # cada chunk: {FECHA_INT, saldo_abs, NROCMP}
+            sub_neg = sub[sub["VALOR"] < 0]
+            if not sub_neg.empty:
+                idx_ult_neg = sub_neg["FECHA_INT"].idxmax()
+                fila_fecha = sub_neg.loc[idx_ult_neg]
+            else:
+                idx_ult = sub["FECHA_INT"].idxmax()
+                fila_fecha = sub.loc[idx_ult]
 
-            for _, row in sub.iterrows():
-                v = float(row.get("VALOR", 0) or 0)
-                if v == 0:
-                    continue
-                fecha_int = int(float(row.get("FECHA", 0) or 0))
+            nroc = None
+            if "NROCMP" in fila_fecha.index:
+                try:
+                    nroc = float(fila_fecha.get("NROCMP", 0) or 0)
+                except Exception:
+                    nroc = fila_fecha.get("NROCMP")
 
-                if v < 0:
-                    saldo_abs = abs(v)
-                    nroc = None
-                    if "NROCMP" in row.index:
-                        try:
-                            nroc = float(row.get("NROCMP", 0) or 0)
-                        except Exception:
-                            nroc = row.get("NROCMP")
-                    cola_chunks.append({"FECHA": fecha_int, "saldo_abs": saldo_abs, "NROCMP": nroc})
-                else:
-                    # Positivo: consume saldo de chunks más antiguos (mismo NUMDOC)
-                    reverso = v
-                    while reverso > 0 and cola_chunks:
-                        primero = cola_chunks[0]
-                        tomar = min(primero["saldo_abs"], reverso)
-                        primero["saldo_abs"] -= tomar
-                        reverso -= tomar
-                        if primero["saldo_abs"] <= 0:
-                            cola_chunks.pop(0)
-
-            # Devolver solo lo que quedó disponible (saldo por chunk)
-            for ch in cola_chunks:
-                if ch.get("saldo_abs", 0) <= 0:
-                    continue
-                vigentes.append(
-                    {
-                        "FECHA": ch["FECHA"],
-                        "VALOR": -float(ch["saldo_abs"]),
-                        "NROCMP": ch.get("NROCMP"),
-                        "NUMDOC": numdoc,
-                    }
-                )
+            vigentes.append(
+                {
+                    "FECHA": int(fila_fecha["FECHA_INT"]),
+                    "VALOR": saldo_neto,  # neto por NUMDOC (negativo = vigente)
+                    "NROCMP": nroc,
+                    "NUMDOC": numdoc,
+                }
+            )
 
         # Orden salida: más reciente -> más antiguo
         vigentes.sort(key=lambda x: int(float(x.get("FECHA") or 0)), reverse=True)
@@ -550,6 +535,36 @@ def _float_val(row, col, default=0.0):
         return default
 
 
+def _contar_filas_por_cajero(df: pd.DataFrame, col_cajero: str, cajero: int) -> int:
+    """Cantidad de filas en ARQUEOS MF (hoja actual) para el mismo código de cajero."""
+    n = 0
+    for _, row in df.iterrows():
+        if pd.isna(row.get(col_cajero)):
+            continue
+        try:
+            c = int(float(row[col_cajero]))
+        except (ValueError, TypeError):
+            continue
+        if c == cajero:
+            n += 1
+    return n
+
+
+TEXTO_ACLARAR_REPETIR_ARQUEO = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+
+
+def texto_gestion_faltante_pequeno_centralizado(fecha_gestion_dd_mm_yyyy: str) -> str:
+    """
+    Texto estándar para faltante residual muy bajo: contabilización centralizada en cuenta de faltantes.
+    fecha_gestion_dd_mm_yyyy: día de la ejecución (fecha descarga / proceso), formato DD/MM/YYYY.
+    """
+    return (
+        "La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada "
+        f"a la cuenta de faltantes 168710093 el {fecha_gestion_dd_mm_yyyy}, esta diferencia ingresa a proceso "
+        "de investigación en el área para identificar a que corresponde."
+    )
+
+
 def procesar_cuadrados_fecha_descarga(
     lector,
     admin_bd,
@@ -592,6 +607,13 @@ def procesar_cuadrados_fecha_descarga(
     # Fecha de gestión (día de hoy o de gestión) para el texto de cruce faltante-sobrante
     fecha_gestion_str = f"{fecha_descarga.day:02d}/{fecha_descarga.month:02d}/{fecha_descarga.year}"
 
+    try:
+        from src.config.cargador_config import CargadorConfig
+        _umb = CargadorConfig().obtener_umbrales_remanente()
+    except Exception:
+        _umb = {}
+    lim_faltante_grabar = float(_umb.get("faltante_maximo_grabar_cuenta_faltantes", 20_000))
+
     indices_a_actualizar = []
     for idx, row in df.iterrows():
         if _valor_a_fecha(row.get(col_fecha_descarga)) != fecha_descarga:
@@ -625,6 +647,12 @@ def procesar_cuadrados_fecha_descarga(
         )
         if remanente_final is None:
             continue
+        # Faltante que queda después de aplicar el remanente calculado (770500 + 810291 + cruces sobrantes en fórmula/valor).
+        faltante_residual = max(0.0, float(d0) - float(remanente_final))
+        # Solo si queda faltante real (no ruido de redondeo) y es menor o igual al umbral operativo.
+        faltante_pequeno_grabar = (faltante_residual > tolerancia) and (
+            faltante_residual <= lim_faltante_grabar + tolerancia
+        )
         formula_remanente = detalle.get("formula_remanente")
         if formula_remanente:
             df.at[idx, col_remanente] = formula_remanente
@@ -638,8 +666,24 @@ def procesar_cuadrados_fecha_descarga(
         if gestion_no_vacia:
             logger.info("Cajero %s (F. arqueo %s): Gestión a Realizar ya tiene valor; no se sobrescribe. Remanente actualizado.", cajero, fa)
         elif detalle.get("gestion_manual"):
-            df.at[idx, col_gestion] = "Gestión manual - Revisar por el personal encargado"
-            logger.info("Cajero %s (F. arqueo %s): faltante > umbral sin más 810291; Gestión manual.", cajero, fa)
+            # Faltante residual muy bajo: grabar en cuenta faltantes (no repetir arqueo por montos triviales).
+            if faltante_pequeno_grabar:
+                df.at[idx, col_gestion] = texto_gestion_faltante_pequeno_centralizado(fecha_gestion_str)
+                logger.info(
+                    "Cajero %s (F. arqueo %s): gestión manual evitada; faltante residual %.2f <= %.0f; texto cuenta 168710093.",
+                    cajero, fa, faltante_residual, lim_faltante_grabar,
+                )
+            # Si tras todas las reglas sigue faltante (gestión manual) pero es la única fila de ese cajero
+            # en ARQUEOS MF, pedir aclarar y repetir arqueo en lugar de escalar a gestión manual genérica.
+            elif _contar_filas_por_cajero(df, col_cajero, cajero) == 1:
+                df.at[idx, col_gestion] = TEXTO_ACLARAR_REPETIR_ARQUEO
+                logger.info(
+                    "Cajero %s (F. arqueo %s): persiste faltante tras reglas; único arqueo del cajero en ARQUEOS MF; %s.",
+                    cajero, fa, TEXTO_ACLARAR_REPETIR_ARQUEO,
+                )
+            else:
+                df.at[idx, col_gestion] = "Gestión manual - Revisar por el personal encargado"
+                logger.info("Cajero %s (F. arqueo %s): faltante > umbral sin más 810291; Gestión manual.", cajero, fa)
         elif detalle.get("ratificado_cuadrado"):
             df.at[idx, col_gestion] = TEXTO_CAJERO_CUADRADO
             logger.info("Cajero %s (F. arqueo %s): ratificado cuadrado, remanente banco %.2f.", cajero, fa, detalle.get("remanente_banco", 0))
@@ -661,38 +705,40 @@ def procesar_cuadrados_fecha_descarga(
             logger.info("Cajero %s (F. arqueo %s): faltante justificado con sobrantes, remanente %.2f (banco %.2f + sobrantes %.2f). Gestión: %s",
                         cajero, fa, remanente_final, detalle.get("remanente_banco", 0), detalle.get("remanente_sobrantes", 0), texto_gestion[:60])
         elif detalle.get("aclarar_diferencia"):
-            # Evitar repetir arqueo 2 veces seguidas: revisar si el arqueo anterior del mismo cajero tuvo la misma calificación.
-            gestion_prev = ""
-            fa_prev = None
-            for _, rprev in df.iterrows():
-                if pd.isna(rprev.get(col_cajero)):
-                    continue
-                try:
-                    c_prev = int(float(rprev.get(col_cajero)))
-                except (ValueError, TypeError):
-                    continue
-                if c_prev != cajero:
-                    continue
-                fa_candidate = _valor_a_fecha(rprev.get(col_fecha_arqueo))
-                if fa_candidate is None or fa_candidate >= fa:
-                    continue
-                if fa_prev is None or fa_candidate > fa_prev:
-                    fa_prev = fa_candidate
-                    gestion_prev = str(rprev.get(col_gestion) or "").strip()
-
-            gestion_prev_norm = gestion_prev.strip().upper()
-            repetir_prev = any(gestion_prev_norm == g.strip().upper() for g in GESTION_REPETIR_ARQUEO_EXACTAS)
-            if repetir_prev:
-                texto_reemplazo = (
-                    "La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada "
-                    "a la cuenta de faltantes 168710093 el " + fecha_gestion_str + ", esta diferencia ingresa a proceso "
-                    "de investigación en el área para identificar a que corresponde."
+            if faltante_pequeno_grabar:
+                df.at[idx, col_gestion] = texto_gestion_faltante_pequeno_centralizado(fecha_gestion_str)
+                logger.info(
+                    "Cajero %s (F. arqueo %s): faltante no cruzado con sobrantes; residual %.2f <= %.0f; texto cuenta 168710093.",
+                    cajero, fa, faltante_residual, lim_faltante_grabar,
                 )
-                df.at[idx, col_gestion] = texto_reemplazo
-                logger.info("Cajero %s (F. arqueo %s): 2da repetición consecutiva; gestionar como faltantes.", cajero, fa)
             else:
-                df.at[idx, col_gestion] = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
-                logger.info("Cajero %s (F. arqueo %s): faltante no justificado con sobrantes; aclarar diferencia y repetir arqueo.", cajero, fa)
+                # Evitar repetir arqueo 2 veces seguidas: revisar si el arqueo anterior del mismo cajero tuvo la misma calificación.
+                gestion_prev = ""
+                fa_prev = None
+                for _, rprev in df.iterrows():
+                    if pd.isna(rprev.get(col_cajero)):
+                        continue
+                    try:
+                        c_prev = int(float(rprev.get(col_cajero)))
+                    except (ValueError, TypeError):
+                        continue
+                    if c_prev != cajero:
+                        continue
+                    fa_candidate = _valor_a_fecha(rprev.get(col_fecha_arqueo))
+                    if fa_candidate is None or fa_candidate >= fa:
+                        continue
+                    if fa_prev is None or fa_candidate > fa_prev:
+                        fa_prev = fa_candidate
+                        gestion_prev = str(rprev.get(col_gestion) or "").strip()
+
+                gestion_prev_norm = gestion_prev.strip().upper()
+                repetir_prev = any(gestion_prev_norm == g.strip().upper() for g in GESTION_REPETIR_ARQUEO_EXACTAS)
+                if repetir_prev:
+                    df.at[idx, col_gestion] = texto_gestion_faltante_pequeno_centralizado(fecha_gestion_str)
+                    logger.info("Cajero %s (F. arqueo %s): 2da repetición consecutiva; gestionar como faltantes.", cajero, fa)
+                else:
+                    df.at[idx, col_gestion] = "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+                    logger.info("Cajero %s (F. arqueo %s): faltante no justificado con sobrantes; aclarar diferencia y repetir arqueo.", cajero, fa)
         elif detalle.get("sobrante_contabilizado_gerencia"):
             texto_sobrante = f"La diferencia es contabilizada por la Gerencia De Autoservicios y Efectivo de manera centralizada a la cuenta de sobrantes 279510020 el {fecha_gestion_str}"
             df.at[idx, col_gestion] = texto_sobrante

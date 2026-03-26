@@ -35,8 +35,20 @@ remanente:
   faltante_minimo_para_810291: 50000000   # 50M
   # Faltante máximo para ir a cuenta sobrantes: si faltante <= este valor, se busca en sobrantes; si > y no hay más 810291, Gestión manual.
   faltante_limite_sobrantes: 25000000     # 25M
+  # Si tras 770500/810291 y cruces con sobrantes el faltante residual es <= este valor, no repetir arqueo:
+  # "Gestión a Realizar" = contabilización centralizada cuenta faltantes 168710093 (fecha = ejecución / fecha descarga).
+  faltante_maximo_grabar_cuenta_faltantes: 20000
   # Rango sobrantes: si true, "hasta" = dia del arqueo; si false, "hasta" = dia anterior al arqueo.
   sobrantes_incluir_dia_arqueo: true
+
+# Reglas aplicadas al archivo de gestion al momento de leerlo.
+reglas_gestion:
+  diario_sobrantes_extremos:
+    activo: true
+    # Tramo alto: abs(sobrantes) >= limite_sobrante_negativo.
+    limite_sobrante_negativo: 1000000000
+    # Tramo medio: limite_sobrante_medio_minimo <= abs(sobrantes) < limite_sobrante_negativo.
+    limite_sobrante_medio_minimo: 50000000
 
 # Conexión a base de datos NACIONAL (ODBC). Igual que reglas_dispensadores.
 base_datos:
