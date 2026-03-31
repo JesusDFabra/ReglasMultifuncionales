@@ -6,6 +6,8 @@ from pathlib import Path
 from glob import glob
 from typing import Optional, Set, Tuple, Union
 from datetime import datetime, date
+import shutil
+import re
 import pandas as pd
 import logging
 
@@ -22,12 +24,89 @@ MESES_NOMBRE = (
 # Texto fijo en gestión cuando ARQUEOS MF indica cajero cuadrado (prevalece sobre otras observaciones).
 OBSERVACIONES_CUADRADO_EN_ARQUEO = "CUADRADO EN ARQUEO"
 
+# Columna de trazabilidad en Excel de gestión (solo filas DIARIO cuando aplica la regla).
+COL_PASO_A_PASO_GESTION = "paso_a_paso_regla"
+
 
 class LectorInsumos:
     """Carga los archivos Excel de insumo según la configuración."""
 
     def __init__(self, config: Optional[CargadorConfig] = None):
         self.config = config or CargadorConfig()
+        # Tras preparar_copia_gestion_procesada(), las reglas leen/escriben solo esta ruta (copia *_procesado).
+        self._ruta_gestion_escritura: Optional[Path] = None
+
+    @staticmethod
+    def _fusionar_traza_gestion(prev: object, nuevo: str, sep: str = " | ") -> str:
+        a = str(prev if prev is not None else "").strip()
+        n = (nuevo or "").strip()
+        if not n:
+            return a
+        if not a:
+            return n
+        if n in a:
+            return a
+        return f"{a}{sep}{n}"
+
+    @staticmethod
+    def _col_cajero_en_df(df: pd.DataFrame) -> Optional[str]:
+        for c in df.columns:
+            if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
+                return c
+        return None
+
+    def _ruta_gestion_original_resuelta(self, fecha: Optional[str] = None) -> Path:
+        """
+        Resuelve el archivo de gestión fuente (nunca el *_procesado).
+        Excluye *_procesado* del glob para no tomar la copia como insumo.
+        """
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        ruta = self._ruta_archivo("gestion_erestrad", fecha_usar)
+        if ruta.exists() and "_procesado" not in ruta.stem.lower():
+            return ruta
+        directorio = self._directorio_insumo("gestion_erestrad")
+        patron_fallback = str(directorio / f"gestion/gestion_{fecha_usar}_*.xlsx")
+        candidatos = [
+            Path(p) for p in glob(patron_fallback) if "_procesado" not in Path(p).stem.lower()
+        ]
+        candidatos = sorted(candidatos, key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidatos:
+            ruta_alt = candidatos[0]
+            logger.info("Usando archivo de gestión alternativo: %s", ruta_alt)
+            return ruta_alt
+        if ruta.exists():
+            return ruta
+        raise FileNotFoundError(
+            f"No se encontró el archivo: {ruta}. "
+            f"Tampoco archivos con patrón (excl. *_procesado): {patron_fallback}"
+        )
+
+    def preparar_copia_gestion_procesada(self, fecha: Optional[str] = None) -> Path:
+        """
+        Copia la gestión original a un archivo con sufijo _procesado antes de aplicar reglas.
+        El original no se modifica; leer_gestion_erestrad y reglas posteriores usan la copia.
+        """
+        orig = self._ruta_gestion_original_resuelta(fecha)
+        proc = orig.with_name(f"{orig.stem}_procesado{orig.suffix}")
+        try:
+            shutil.copy2(orig, proc)
+        except PermissionError:
+            # Si _procesado está bloqueado por otro proceso, usar un nombre alterno y continuar.
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            proc = orig.with_name(f"{orig.stem}_procesado_{ts}{orig.suffix}")
+            shutil.copy2(orig, proc)
+        self._ruta_gestion_escritura = proc.resolve()
+        logger.info(
+            "Gestión: salida de reglas en %s (original sin cambios: %s).",
+            proc.name,
+            orig.name,
+        )
+        return proc
+
+    def _ruta_gestion_para_escritura(self, fecha: Optional[str] = None) -> Path:
+        if self._ruta_gestion_escritura is not None:
+            return self._ruta_gestion_escritura
+        return self._ruta_gestion_original_resuelta(fecha)
 
     def _directorio_insumo(self, nombre_insumo: str):
         """Directorio base para un insumo: insumo.directorio si existe, sino directorios.insumos."""
@@ -154,9 +233,11 @@ class LectorInsumos:
         mask: pd.Series,
         df: pd.DataFrame,
         hoja: Optional[str] = None,
+        paso_a_paso_etiqueta: Optional[str] = None,
     ) -> None:
         """
         Persiste en el archivo de gestión los campos ajustados por la regla de sobrantes extremos.
+        Si paso_a_paso_etiqueta se informa, en filas tipo DIARIO se escribe/concatena COL_PASO_A_PASO_GESTION al final de la hoja.
         """
         if mask is None or not bool(mask.any()):
             return
@@ -179,7 +260,19 @@ class LectorInsumos:
         idx_just = headers_norm.get("justificacion")
         idx_estado = headers_norm.get("nuevo_estado")
         idx_obs = headers_norm.get("observaciones")
+        idx_sobrantes = headers_norm.get("sobrantes")
+        idx_faltantes = headers_norm.get("faltantes")
 
+        idx_traza = None
+        if paso_a_paso_etiqueta:
+            k = COL_PASO_A_PASO_GESTION.strip().lower()
+            idx_traza = headers_norm.get(k)
+            if not idx_traza:
+                idx_traza = ws.max_column + 1
+                ws.cell(row=1, column=idx_traza).value = COL_PASO_A_PASO_GESTION
+                headers_norm[k] = idx_traza
+
+        col_caj_df = self._col_cajero_en_df(df)
         escritos = 0
         for idx in mask[mask].index:
             excel_row = int(idx) + 2  # +1 por encabezado y +1 por índice 0-based
@@ -195,11 +288,31 @@ class LectorInsumos:
                 ws.cell(row=excel_row, column=idx_estado).value = df.at[idx, "nuevo_estado"] if "nuevo_estado" in df.columns else "ERROR EN TRANSMISION DE CONTADORES"
             if idx_obs:
                 ws.cell(row=excel_row, column=idx_obs).value = df.at[idx, "observaciones"] if "observaciones" in df.columns else "SALDO NO REAL"
+            if idx_sobrantes and "sobrantes" in df.columns:
+                ws.cell(row=excel_row, column=idx_sobrantes).value = df.at[idx, "sobrantes"]
+            if idx_faltantes and "faltantes" in df.columns:
+                ws.cell(row=excel_row, column=idx_faltantes).value = df.at[idx, "faltantes"]
+
+            if idx_traza and "tipo_registro" in df.columns:
+                tipo = str(df.at[idx, "tipo_registro"]).strip().upper()
+                if tipo in ("DIARIO", "DIADIO"):
+                    partes = [paso_a_paso_etiqueta or ""]
+                    if col_caj_df:
+                        partes.append(f"cajero={df.at[idx, col_caj_df]}")
+                    if "sobrantes" in df.columns:
+                        partes.append(f"sobrantes={df.at[idx, 'sobrantes']}")
+                    for cn in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones"):
+                        if cn in df.columns:
+                            partes.append(f"{cn}={df.at[idx, cn]}")
+                    nuevo_txt = " | ".join(p for p in partes if p)
+                    prev_v = ws.cell(row=excel_row, column=idx_traza).value
+                    ws.cell(row=excel_row, column=idx_traza).value = self._fusionar_traza_gestion(prev_v, nuevo_txt)
+
             escritos += 1
 
         try:
             wb.save(ruta)
-            logger.info("Regla DIARIO sobrantes extremos persistida en archivo gestión (%d fila(s)).", escritos)
+            logger.info("Cambios de regla persistidos en archivo gestión (%d fila(s)).", escritos)
         except PermissionError:
             logger.warning(
                 "No se pudo guardar el archivo de gestión (%s) por PermissionError (¿abierto en Excel?). Se omiten persistencias.",
@@ -235,10 +348,30 @@ class LectorInsumos:
             logger.warning("No hay columna 'observaciones' en gestión; no se persiste CUADRADO EN ARQUEO.")
             return
 
+        k_tr = COL_PASO_A_PASO_GESTION.strip().lower()
+        idx_traza = headers_norm.get(k_tr)
+        if not idx_traza:
+            idx_traza = ws.max_column + 1
+            ws.cell(row=1, column=idx_traza).value = COL_PASO_A_PASO_GESTION
+
+        col_caj_df = self._col_cajero_en_df(df)
         escritos = 0
         for idx in mask[mask].index:
             excel_row = int(idx) + 2
             ws.cell(row=excel_row, column=idx_obs).value = df.at[idx, "observaciones"]
+            if "tipo_registro" in df.columns:
+                tipo = str(df.at[idx, "tipo_registro"]).strip().upper()
+                if tipo in ("DIARIO", "DIADIO"):
+                    partes = [
+                        "CUADRADO_EN_ARQUEO",
+                        "observaciones_forzadas_desde_ARQUEOS_MF",
+                        f"valor_obs={OBSERVACIONES_CUADRADO_EN_ARQUEO}",
+                    ]
+                    if col_caj_df:
+                        partes.insert(2, f"cajero={df.at[idx, col_caj_df]}")
+                    nuevo_txt = " | ".join(partes)
+                    prev_v = ws.cell(row=excel_row, column=idx_traza).value
+                    ws.cell(row=excel_row, column=idx_traza).value = self._fusionar_traza_gestion(prev_v, nuevo_txt)
             escritos += 1
 
         try:
@@ -341,15 +474,11 @@ class LectorInsumos:
         Debe ejecutarse al final del flujo para prevalecer sobre otras reglas de observaciones.
         """
         fecha_usar = fecha or self.config.obtener_fecha_proceso()
-        ruta = self._ruta_archivo("gestion_erestrad", fecha_usar)
-        if not ruta.exists():
-            directorio = self._directorio_insumo("gestion_erestrad")
-            patron_fallback = str(directorio / f"gestion/gestion_{fecha_usar}_*.xlsx")
-            candidatos = sorted(glob(patron_fallback), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-            if not candidatos:
-                logger.warning("No se encontró gestión para %s; no se aplicará CUADRADO EN ARQUEO.", fecha_usar)
-                return 0
-            ruta = Path(candidatos[0])
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning("No se encontró gestión para %s; no se aplicará CUADRADO EN ARQUEO.", fecha_usar)
+            return 0
 
         if hoja_gestion:
             df_gestion = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
@@ -398,16 +527,11 @@ class LectorInsumos:
         fecha_descarga = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
         d, m, a = fecha_descarga.day, fecha_descarga.month, fecha_descarga.year
 
-        # Localizar ruta de archivo de gestión (misma lógica que leer_gestion_erestrad)
-        ruta = self._ruta_archivo("gestion_erestrad", fecha_usar)
-        if not ruta.exists():
-            directorio = self._directorio_insumo("gestion_erestrad")
-            patron_fallback = str(directorio / f"gestion/gestion_{fecha_usar}_*.xlsx")
-            candidatos = sorted(glob(patron_fallback), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-            if not candidatos:
-                logger.warning("No se encontró archivo de gestión para %s; no se aplicará la regla ARQUEO.", fecha_usar)
-                return 0
-            ruta = Path(candidatos[0])
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning("No se encontró archivo de gestión para %s; no se aplicará la regla ARQUEO.", fecha_usar)
+            return 0
 
         # Leer gestión sin aplicar otras reglas (evitar dobles escrituras)
         if hoja_gestion:
@@ -428,6 +552,8 @@ class LectorInsumos:
         col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
         col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
         col_fecha_descarga_arq = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
+        col_diferencia_arq = self._buscar_columna_arqueos(df_arq, ("Diferencia", "diferencia"))
+        col_traza_arq = self._buscar_columna_arqueos(df_arq, ("paso_a_paso_regla",))
         if not (col_cajero_arq and col_gestion_arq and col_fecha_descarga_arq):
             logger.warning("ARQUEOS MF no tiene columnas necesarias para aplicar la regla ARQUEO.")
             return 0
@@ -526,16 +652,11 @@ class LectorInsumos:
         fecha_descarga = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
         m, a = fecha_descarga.month, fecha_descarga.year
 
-        # Resolver ruta de gestión
-        ruta = self._ruta_archivo("gestion_erestrad", fecha_usar)
-        if not ruta.exists():
-            directorio = self._directorio_insumo("gestion_erestrad")
-            patron_fallback = str(directorio / f"gestion/gestion_{fecha_usar}_*.xlsx")
-            candidatos = sorted(glob(patron_fallback), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-            if not candidatos:
-                logger.warning("No se encontró archivo de gestión para %s; no se aplicará regla grabar sobrante.", fecha_usar)
-                return 0
-            ruta = Path(candidatos[0])
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning("No se encontró archivo de gestión para %s; no se aplicará regla grabar sobrante.", fecha_usar)
+            return 0
 
         if hoja_gestion:
             df_gestion = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
@@ -549,6 +670,8 @@ class LectorInsumos:
         col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
         col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
         col_fecha_descarga_arq = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
+        col_diferencia_arq = self._buscar_columna_arqueos(df_arq, ("Diferencia", "diferencia"))
+        col_traza_arq = self._buscar_columna_arqueos(df_arq, ("paso_a_paso_regla", "paso_a_paso_regla"))
         if not (col_cajero_arq and col_gestion_arq and col_fecha_descarga_arq):
             logger.warning("ARQUEOS MF no tiene columnas necesarias para regla grabar sobrante.")
             return 0
@@ -621,7 +744,54 @@ class LectorInsumos:
             # En DIARIO prima la misma observación que ARQUEO para el cajero.
             df_gestion.loc[mask_final, "observaciones"] = "SE GRABA SOBRANTE DE ARQUEO"
 
-        self._persistir_regla_diario_sobrantes_en_excel(ruta, mask_final, df_gestion, hoja=hoja_gestion)
+        # Copiar la diferencia encontrada en ARQUEOS MF a columnas de gestión:
+        # - diferencia <= 0: sobrantes=dif, faltantes=0
+        # - diferencia > 0:  faltantes=dif, sobrantes=0
+        if col_diferencia_arq and ("sobrantes" in df_gestion.columns or "faltantes" in df_gestion.columns):
+            def _parsear_diferencia_desde_traza(txt: object) -> Optional[float]:
+                t = str(txt or "")
+                m_dif = re.search(r"diferencia_actual=\$(-?[0-9\.]+)", t)
+                if not m_dif:
+                    return None
+                try:
+                    return float(m_dif.group(1).replace(".", ""))
+                except (TypeError, ValueError):
+                    return None
+
+            dif_por_cajero = {}
+            cols_arq = [col_cajero_arq, col_diferencia_arq]
+            if col_traza_arq:
+                cols_arq.append(col_traza_arq)
+            for _, r in df_arq.loc[mask_grabar, cols_arq].iterrows():
+                try:
+                    caj = int(float(r[col_cajero_arq]))
+                    dif = float(r[col_diferencia_arq]) if pd.notna(r[col_diferencia_arq]) else None
+                    if dif is None and col_traza_arq:
+                        dif = _parsear_diferencia_desde_traza(r.get(col_traza_arq))
+                    if dif is not None:
+                        # Si hay más de una fila para el cajero, conservar la última del dataframe filtrado.
+                        dif_por_cajero[caj] = dif
+                except (TypeError, ValueError):
+                    continue
+            for idx in df_gestion[mask_final_arqueo].index:
+                try:
+                    caj = int(float(df_gestion.at[idx, col_cajero_gestion]))
+                except (TypeError, ValueError):
+                    continue
+                if caj in dif_por_cajero:
+                    dif = float(dif_por_cajero[caj])
+                    if "sobrantes" in df_gestion.columns:
+                        df_gestion.at[idx, "sobrantes"] = dif if dif <= 0 else 0
+                    if "faltantes" in df_gestion.columns:
+                        df_gestion.at[idx, "faltantes"] = dif if dif > 0 else 0
+
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask_final,
+            df_gestion,
+            hoja=hoja_gestion,
+            paso_a_paso_etiqueta="Grabar_sobrante_279510020_ARQUEOS_MF",
+        )
         logger.info(
             "Regla grabar sobrante desde ARQUEOS MF persistida: %d fila(s) [ARQUEO=%d, DIARIO=%d].",
             int(mask_final.sum()),
@@ -635,10 +805,9 @@ class LectorInsumos:
         Lee el archivo de gestion para la fecha indicada.
 
         Comportamiento:
-        1) Intenta la ruta exacta configurada (por defecto: gestion_{fecha}_erestrad.xlsx).
-        2) Si no existe, busca fallback por patron amplio en la carpeta de gestion:
-           gestion_{fecha}_*.xlsx
-           (ej: gestion_20_03_2026_anajaram.xlsx).
+        1) Sin preparar_copia_gestion_procesada(): lee la gestión original (misma resolución que antes).
+        2) Tras preparar_copia_gestion_procesada() en main: lee/escribe solo el archivo *_procesado.xlsx
+           (el original no se modifica).
 
         Args:
             fecha: DD_MM_YYYY. Si no se pasa, usa config o fecha actual.
@@ -647,28 +816,22 @@ class LectorInsumos:
         Returns:
             DataFrame con el contenido del archivo.
         """
-        ruta = self._ruta_archivo("gestion_erestrad", fecha)
-        if not ruta.exists():
-            fecha_usar = fecha or self.config.obtener_fecha_proceso()
-            directorio = self._directorio_insumo("gestion_erestrad")
-            patron_fallback = str(directorio / f"gestion/gestion_{fecha_usar}_*.xlsx")
-            candidatos = sorted(glob(patron_fallback), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-            if not candidatos:
-                raise FileNotFoundError(
-                    f"No se encontró el archivo: {ruta}. "
-                    f"Tampoco se encontraron archivos con patrón: {patron_fallback}"
-                )
-            ruta = Path(candidatos[0])
-            logger.info("Usando archivo de gestión alternativo: %s", ruta)
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        ruta = self._ruta_gestion_para_escritura(fecha_usar)
         logger.info(f"Leyendo gestión erestrad: {ruta}")
         if hoja:
             df = pd.read_excel(ruta, sheet_name=hoja, engine="openpyxl")
         else:
             df = pd.read_excel(ruta, engine="openpyxl")
-        fecha_usar = fecha or self.config.obtener_fecha_proceso()
         df, mask_regla = self._aplicar_regla_diario_sobrantes_extremos(df, fecha=fecha_usar)
         if bool(mask_regla.any()):
-            self._persistir_regla_diario_sobrantes_en_excel(ruta, mask_regla, df=df, hoja=hoja)
+            self._persistir_regla_diario_sobrantes_en_excel(
+                ruta,
+                mask_regla,
+                df=df,
+                hoja=hoja,
+                paso_a_paso_etiqueta="DIARIO_sobrantes_extremos",
+            )
         mask_cuad = self._aplicar_observaciones_cuadrado_en_df(df, fecha_usar, hoja_arqueos_mf=0)
         if bool(mask_cuad.any()):
             self._persistir_solo_observaciones_gestion(ruta, mask_cuad, df, hoja=hoja)

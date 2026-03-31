@@ -187,6 +187,7 @@ def main(
         pegar_gestion = pegar_consolidado = False
 
     if pegar_gestion or pegar_consolidado or omitir_copiado_por_fecha_existente:
+        lector.preparar_copia_gestion_procesada(fecha_usar)
         if pegar_gestion:
             df_gestion = lector.leer_gestion_erestrad(fecha=fecha_usar)
             pegar_gestion_a_arqueos_mf(

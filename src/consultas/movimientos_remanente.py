@@ -22,6 +22,17 @@ NROCMP_SUCURSAL = 810291  # Solo si justifica la diferencia tras ajustar 770500
 NROCMP_PROVISION = (810291, 770500)
 TOLERANCIA_JUSTIFICAR = 1.0  # 1 peso de tolerancia al comparar diferencia con 810291
 
+# Columna en ARQUEOS MF con seguimiento de reglas (procesar_cuadrados_fecha_descarga).
+COL_PASO_A_PASO_ARQUEOS_MF = "paso_a_paso_regla"
+
+
+def _fmt_traza_num(v: float) -> str:
+    try:
+        vi = int(round(float(v)))
+        return f"${vi:,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return str(v)
+
 
 def consultar_movimientos_dia_arqueo(
     admin_bd,
@@ -257,7 +268,7 @@ def calcular_remanente_para_cajero_cuadrado(
 ) -> Tuple[Optional[float], Dict[str, Any]]:
     """
     1) Ajuste 770500 (signo contrario al de la BD). Construye términos de fórmula.
-    2) Si faltante > umbral_810291 (50M): aplicar 810291 en orden CLVMOV (uno a uno) con signo contrario.
+    2) Si |diferencia| > umbral_810291 (50M): aplicar 810291 en orden CLVMOV (uno a uno) con signo contrario.
     3) Si faltante restante <= umbral_sobrantes (20M): buscar en cuenta sobrantes; si coincide, agregar.
     4) Si faltante > 20M y no hay más 810291: gestion_manual.
     Remanente se escribe como fórmula Excel "=valor1+valor2-valor3..."
@@ -284,13 +295,19 @@ def calcular_remanente_para_cajero_cuadrado(
         "aclarar_diferencia": False,  # Faltante <= umbral sobrantes pero no se logró justificar con sobrantes
         "sobrante_contabilizado_gerencia": False,  # Tras 770500+810291 queda sobrante; se graba texto cuenta 279510020
         "formula_remanente": None,
+        "traza_pasos": [],
     }
     d0 = saldo_contable - (efectivo_arqueado + (dispensado_corte_arqueo or 0) - (recibido_corte_arqueo or 0))
     detalle["diferencia_sin_remanente"] = d0
     terminos = []  # términos para "=t1+t2-t3..."
+    detalle["traza_pasos"].append(
+        f"Inicio_cajero={nit} | fecha_arqueo={dia:02d}/{mes:02d}/{anio} | "
+        f"d0(Saldo-(Efectivo+Dispensado-Recibido))={_fmt_traza_num(d0)}"
+    )
 
     movs = consultar_movimientos_dia_arqueo(admin_bd, nit, anio, mes, dia)
     if movs is None:
+        detalle["traza_pasos"].append("ERROR no se pudieron leer movimientos 770500/810291 en NACIONAL para ese día")
         return (None, detalle)
     movs_banco = [m for m in movs if int(float(m.get("NROCMP", 0))) == NROCMP_BANCO]
     movs_810291 = [m for m in movs if int(float(m.get("NROCMP", 0))) == NROCMP_SUCURSAL]
@@ -317,12 +334,16 @@ def calcular_remanente_para_cajero_cuadrado(
 
     diferencia = d0 - remanente
     detalle["diferencia_after_banco"] = diferencia
+    detalle["traza_pasos"].append(
+        f"Tras_770500 movs={len(movs_banco)} | remanente_770500(aplicado_con_signo_inv_BD)={_fmt_traza_num(remanente)} | "
+        f"diferencia_d0_menos_remanente={_fmt_traza_num(diferencia)}"
+    )
 
     # Aplicar 810291 en alternancia: preferir positivo luego negativo; si no hay del turno, aplicar del otro (así se permiten solo negativos o solo positivos).
     aplicados_810291 = []
     ip, in_ = 0, 0
     apply_positive_next = True  # preferir empezar por un positivo
-    while diferencia > lim_810291:  # solo entrar si faltante > 50M
+    while abs(diferencia) > lim_810291:  # entrar por magnitud: faltante o sobrante > 50M
         aplicado = False
         if apply_positive_next:
             if ip < len(positivos_810291):
@@ -369,27 +390,49 @@ def calcular_remanente_para_cajero_cuadrado(
         if not aplicado:
             break
         diferencia = d0 - remanente
-        if diferencia <= lim_sobrantes:
+        if abs(diferencia) <= lim_sobrantes:
             break
     detalle["remanente_810291"] = sum(aplicados_810291)
+    if aplicados_810291:
+        detalle["traza_pasos"].append(
+            f"810291 aplicados={len(aplicados_810291)} | umbral_entrada_|diferencia|>{_fmt_traza_num(lim_810291)} | "
+            f"aporte_810291_total={_fmt_traza_num(detalle['remanente_810291'])} | diferencia_actual={_fmt_traza_num(diferencia)}"
+        )
+    else:
+        detalle["traza_pasos"].append(
+            f"810291 no aplica (|diferencia| tras 770500 no supera {_fmt_traza_num(lim_810291)} o sin movimientos) | "
+            f"diferencia={_fmt_traza_num(diferencia)}"
+        )
 
     if abs(diferencia) <= tolerancia:
         detalle["ratificado_cuadrado"] = True
         detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+        detalle["traza_pasos"].append(
+            f"RESULTADO cuadrado | |diferencia|<=tolerancia({_fmt_traza_num(tolerancia)}) | remanente={_fmt_traza_num(remanente)}"
+        )
         return (remanente, detalle)
 
     if diferencia <= 0:
         detalle["sobrante_contabilizado_gerencia"] = True
         detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+        detalle["traza_pasos"].append(
+            f"RESULTADO sobrante tras banco | diferencia<={_fmt_traza_num(0)} -> sugiere texto Gestión MF cuenta 279510020 (si celda vacía)"
+        )
         return (remanente, detalle)
 
     # Faltante restante: cruce con sobrantes según regla (exacto desde más reciente o desde más antiguo; orden salida: más antiguo a más reciente)
     faltante = diferencia
     if faltante <= lim_sobrantes:
         detalle["aclarar_diferencia"] = True  # Por defecto; se pondrá False si se logra justificar con sobrantes
+        detalle["traza_pasos"].append(
+            f"Faltante restante={_fmt_traza_num(faltante)} <= umbral_sobrantes({_fmt_traza_num(lim_sobrantes)}) | "
+            "buscar cruce en cuenta 279510020 (NUMDOC suma neta negativa = sobrante activo)"
+        )
         vigentes = consultar_sobrantes_negativos_vigentes(
             admin_bd, nit, anio, mes, dia, fecha_desde=fecha_desde_sobrantes, incluir_dia_arqueo=incluir_dia_arqueo_sob
         )
+        if vigentes is None:
+            detalle["traza_pasos"].append("Cuenta 279510020: consulta de sobrantes vigentes devolvió None (revisar conexión o consulta)")
         if vigentes is not None:
             vigentes = [m for m in vigentes if float(m.get("VALOR", 0) or 0) < 0]
             fecha_arqueo_int = anio * 10000 + mes * 100 + dia
@@ -402,6 +445,9 @@ def calcular_remanente_para_cajero_cuadrado(
             if en_dia_arqueo > 1:
                 detalle["gestion_manual"] = True
                 detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+                detalle["traza_pasos"].append(
+                    f"RESULTADO gestión manual | >1 movimiento sobrante con NUMDOC=día arqueo ({en_dia_arqueo})"
+                )
                 return (remanente, detalle)
             # Etapa 1/2 y orden de consumo dependen del "DIARIO" (NUMDOC = YYYYMMDD)
             # Para desempate dentro de un mismo NUMDOC, consumimos por fecha de grabación más antigua a más reciente.
@@ -467,6 +513,10 @@ def calcular_remanente_para_cajero_cuadrado(
                     if utilizados:
                         detalle["fecha_sobrante_str"] = utilizados[-1].get("fecha_str", "")
                     detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+                    detalle["traza_pasos"].append(
+                        "RESULTADO justificado_sobrantes | etapa1 NUMDOC posteriores al penúltimo arqueo | "
+                        f"cant_chunks={len(utilizados)}"
+                    )
                     return (remanente, detalle)
 
             # Etapa 2: si faltante > suma disponible después del penúltimo,
@@ -496,6 +546,9 @@ def calcular_remanente_para_cajero_cuadrado(
                         terminos.append(_term_formula(u["valor"]))
                         remanente += u["valor"]
                     detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+                    detalle["traza_pasos"].append(
+                        "RESULTADO justificado_sobrantes | etapa2 solo posteriores al penúltimo cubren faltante"
+                    )
                     return (remanente, detalle)
 
             running_sum_pen, utilizados_pen = _intentar_cruce(vigentes_penultimo, remaining)
@@ -513,13 +566,31 @@ def calcular_remanente_para_cajero_cuadrado(
                 if total_utilizados:
                     detalle["fecha_sobrante_str"] = total_utilizados[-1].get("fecha_str", "")
                 detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+                detalle["traza_pasos"].append(
+                    "RESULTADO justificado_sobrantes | etapa2 posteriores + penúltimo día (cruce parcial)"
+                )
                 return (remanente, detalle)
+            detalle["traza_pasos"].append(
+                "Cruce sobrantes | no alcanzó faltante exacto | queda aclarar_diferencia o gestión manual"
+            )
     else:
         # Faltante > 20M y no se pudo seguir alternando 810291 (falta positivo o negativo): gestión manual
+        detalle["traza_pasos"].append(
+            f"Faltante {_fmt_traza_num(diferencia)} > umbral_sobrantes({_fmt_traza_num(lim_sobrantes)}) | "
+            "no entra cruce por cuenta sobrantes en este bloque"
+        )
         if diferencia > lim_sobrantes:
             detalle["gestion_manual"] = True
 
     detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+    if detalle.get("gestion_manual"):
+        detalle["traza_pasos"].append(
+            "RESULTADO gestión manual | faltante sin cerrar con 810291/sobrantes según reglas"
+        )
+    elif detalle.get("aclarar_diferencia") and not detalle.get("justificado_sobrantes"):
+        detalle["traza_pasos"].append(
+            "RESULTADO pendiente aclarar/repetir o faltante pequeño 168710093 (según paso ARQUEOS MF)"
+        )
     return (remanente, detalle)
 
 
@@ -579,6 +650,7 @@ def procesar_cuadrados_fecha_descarga(
     Para cada uno: revisa movimientos 770500 el día del arqueo y ajusta Remanente (signo contrario al de la BD).
     Si queda faltante, busca en cuenta sobrantes (279510020) negativos vigentes que lo justifiquen (cruce).
     Si queda cuadrado, ratifica y puede escribir "Cajero cuadrado...". Actualiza Excel, fórmulas y Gestión a Realizar.
+    La columna paso_a_paso_regla en ARQUEOS MF solo se escribe si remanente.columna_paso_a_paso_arqueos_mf es true en config.
 
     Returns:
         Número de registros actualizados (con Remanente y/o Gestión).
@@ -607,14 +679,24 @@ def procesar_cuadrados_fecha_descarga(
     # Fecha de gestión (día de hoy o de gestión) para el texto de cruce faltante-sobrante
     fecha_gestion_str = f"{fecha_descarga.day:02d}/{fecha_descarga.month:02d}/{fecha_descarga.year}"
 
+    col_traza = COL_PASO_A_PASO_ARQUEOS_MF
     try:
         from src.config.cargador_config import CargadorConfig
-        _umb = CargadorConfig().obtener_umbrales_remanente()
+        _cfg = CargadorConfig()
+        _umb = _cfg.obtener_umbrales_remanente()
+        escribir_traza_arqueos_mf = _cfg.columna_paso_a_paso_arqueos_mf_activa()
     except Exception:
         _umb = {}
+        escribir_traza_arqueos_mf = True
     lim_faltante_grabar = float(_umb.get("faltante_maximo_grabar_cuenta_faltantes", 20_000))
 
+    if escribir_traza_arqueos_mf:
+        if col_traza not in df.columns:
+            df[col_traza] = ""
+        df[col_traza] = df[col_traza].apply(lambda x: "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
+
     indices_a_actualizar = []
+    filas_con_traza = 0
     for idx, row in df.iterrows():
         if _valor_a_fecha(row.get(col_fecha_descarga)) != fecha_descarga:
             continue
@@ -646,6 +728,11 @@ def procesar_cuadrados_fecha_descarga(
             fecha_desde_sobrantes=fecha_desde_sob,
         )
         if remanente_final is None:
+            if escribir_traza_arqueos_mf:
+                pasos_err = list(detalle.get("traza_pasos") or [])
+                pasos_err.append("ARQUEOS_MF: no se pudo calcular remanente | columna Remanente sin cambios en esta fila")
+                df.at[idx, col_traza] = " | ".join(pasos_err)
+                filas_con_traza += 1
             continue
         # Faltante que queda después de aplicar el remanente calculado (770500 + 810291 + cruces sobrantes en fórmula/valor).
         faltante_residual = max(0.0, float(d0) - float(remanente_final))
@@ -746,7 +833,63 @@ def procesar_cuadrados_fecha_descarga(
         else:
             logger.info("Cajero %s (F. arqueo %s): remanente actualizado %.2f (banco %.2f).", cajero, fa, remanente_final, detalle.get("remanente_banco", 0))
 
-    if not indices_a_actualizar:
+        if escribir_traza_arqueos_mf:
+            pasos_fin = list(detalle.get("traza_pasos") or [])
+            pasos_fin.append(
+                f"ARQUEOS_MF_post | faltante_residual_d0_menos_remanente_calc={_fmt_traza_num(faltante_residual)} | "
+                f"umbral_grabar_faltantes={_fmt_traza_num(lim_faltante_grabar)}"
+            )
+            if gestion_no_vacia:
+                pasos_fin.append("Escritura_Gestion_MF: omitida | celda ya tenía texto")
+            elif detalle.get("gestion_manual"):
+                if faltante_pequeno_grabar:
+                    pasos_fin.append("Escritura_Gestion_MF: contabilización faltantes 168710093 (residual pequeño tras reglas)")
+                elif _contar_filas_por_cajero(df, col_cajero, cajero) == 1:
+                    pasos_fin.append(f"Escritura_Gestion_MF: {TEXTO_ACLARAR_REPETIR_ARQUEO}")
+                else:
+                    pasos_fin.append("Escritura_Gestion_MF: revisión manual personal encargado")
+            elif detalle.get("ratificado_cuadrado"):
+                pasos_fin.append("Escritura_Gestion_MF: texto cajero cuadrado")
+            elif detalle.get("justificado_sobrantes"):
+                pasos_fin.append("Escritura_Gestion_MF: cruce faltante con sobrante(s) 279510020 (texto reverso sección)")
+            elif detalle.get("aclarar_diferencia"):
+                if faltante_pequeno_grabar:
+                    pasos_fin.append("Escritura_Gestion_MF: 168710093 por residual pequeño (sin cruce sobrantes)")
+                else:
+                    gestion_prev_a = ""
+                    fa_prev_a = None
+                    for _, rprev in df.iterrows():
+                        if pd.isna(rprev.get(col_cajero)):
+                            continue
+                        try:
+                            c_prev = int(float(rprev.get(col_cajero)))
+                        except (ValueError, TypeError):
+                            continue
+                        if c_prev != cajero:
+                            continue
+                        fa_candidate = _valor_a_fecha(rprev.get(col_fecha_arqueo))
+                        if fa_candidate is None or fa_candidate >= fa:
+                            continue
+                        if fa_prev_a is None or fa_candidate > fa_prev_a:
+                            fa_prev_a = fa_candidate
+                            gestion_prev_a = str(rprev.get(col_gestion) or "").strip()
+                    gestion_prev_norm = gestion_prev_a.strip().upper()
+                    repetir_prev = any(gestion_prev_norm == g.strip().upper() for g in GESTION_REPETIR_ARQUEO_EXACTAS)
+                    if repetir_prev:
+                        pasos_fin.append("Escritura_Gestion_MF: 168710093 (2da repetición arqueo previo con repetir)")
+                    else:
+                        pasos_fin.append("Escritura_Gestion_MF: ACLARAR DIFERENCIA Y REPETIR EL ARQUEO")
+            elif detalle.get("sobrante_contabilizado_gerencia"):
+                pasos_fin.append(
+                    "Escritura_Gestion_MF: contabilización sobrante cuenta 279510020 (tras 770500/810291 queda lado sobrante)"
+                )
+            else:
+                pasos_fin.append("Escritura_Gestion_MF: sin texto nuevo | solo ajuste de Remanente/Diferencia")
+
+            df.at[idx, col_traza] = " | ".join(pasos_fin)
+            filas_con_traza += 1
+
+    if not indices_a_actualizar and filas_con_traza == 0:
         logger.info("Ningún registro cuadrado con Fecha descarga arqueo = %s para actualizar.", fecha_descarga)
         return 0
     # No aplicar texto de forma masiva: Gestión a Realizar solo se actualiza en las filas ya validadas en BD (arriba)
@@ -756,7 +899,21 @@ def procesar_cuadrados_fecha_descarga(
     _escribir_formula_diferencia_en_excel(ruta)
     filas_formula = [(2 + df.index.get_loc(idx), formula) for (idx, formula) in indices_a_actualizar if formula]
     _escribir_formulas_remanente_en_excel(ruta, filas_formula)
-    logger.info("Procesados %d registro(s) con Fecha descarga arqueo = %s (770500 + 810291 + sobrantes).", len(indices_a_actualizar), fecha_descarga)
+    if escribir_traza_arqueos_mf:
+        logger.info(
+            "Procesados %d registro(s) remanente y %d con columna %s (Fecha descarga arqueo = %s).",
+            len(indices_a_actualizar),
+            filas_con_traza,
+            col_traza,
+            fecha_descarga,
+        )
+    else:
+        logger.info(
+            "Procesados %d registro(s) remanente (columna %s desactivada en config remanente.columna_paso_a_paso_arqueos_mf; Fecha descarga = %s).",
+            len(indices_a_actualizar),
+            col_traza,
+            fecha_descarga,
+        )
     return len(indices_a_actualizar)
 
 

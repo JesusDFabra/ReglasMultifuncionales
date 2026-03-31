@@ -63,6 +63,12 @@ class CargadorConfig:
             "sobrantes_incluir_dia_arqueo": bool(r.get("sobrantes_incluir_dia_arqueo", True)),
         }
 
+    def columna_paso_a_paso_arqueos_mf_activa(self) -> bool:
+        """Si true (default), procesar_cuadrados escribe la columna paso_a_paso_regla en ARQUEOS MF."""
+        config = self.cargar()
+        r = config.get("remanente", {})
+        return bool(r.get("columna_paso_a_paso_arqueos_mf", True))
+
     def obtener_regla_diario_sobrantes(self) -> Dict[str, Any]:
         """
         Regla para filas DIARIO con sobrantes extremos en el archivo de gestion.

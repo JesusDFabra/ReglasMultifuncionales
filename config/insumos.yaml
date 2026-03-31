@@ -40,6 +40,8 @@ remanente:
   faltante_maximo_grabar_cuenta_faltantes: 20000
   # Rango sobrantes: si true, "hasta" = dia del arqueo; si false, "hasta" = dia anterior al arqueo.
   sobrantes_incluir_dia_arqueo: true
+  # Temporal: si true, al procesar cuadrados (fecha descarga) se crea/rellena la columna "paso_a_paso_regla" en ARQUEOS MF.
+  columna_paso_a_paso_arqueos_mf: true
 
 # Reglas aplicadas al archivo de gestion al momento de leerlo.
 reglas_gestion:
