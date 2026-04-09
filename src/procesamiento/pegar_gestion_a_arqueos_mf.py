@@ -5,9 +5,15 @@ Pega en el archivo ARQUEOS MF registros de:
 Misma asociación de columnas origen -> ARQUEOS MF.
 """
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from datetime import date
+from typing import Optional, Dict, Any, Union, Tuple
 import pandas as pd
 import logging
+
+from src.insumos.arqueos_mf_calendario import (
+    periodo_libro_desde_fecha_arqueo,
+    valor_a_fecha_celda,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +439,7 @@ def pegar_gestion_a_arqueos_mf(
     mes: Optional[int] = None,
     anio: Optional[int] = None,
     hoja_arqueos_mf: Union[str, int] = 0,
+    fecha_proceso: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Filtra el archivo de gestión por tipo_registro = ARQUEO, mapea columnas y pega
@@ -442,9 +449,10 @@ def pegar_gestion_a_arqueos_mf(
         df_gestion: DataFrame del archivo de gestión (erestrad).
         ruta_arqueos_mf: Ruta al archivo ARQUEOS MF. Si None, se usa lector + mes/anio.
         lector: LectorInsumos (necesario si ruta_arqueos_mf es None).
-        mes: Mes 1-12 para el archivo ARQUEOS MF.
-        anio: Año para el archivo ARQUEOS MF.
+        mes: Respaldo si una fila no tiene Fecha Arqueo mapeable (mes del libro).
+        anio: Respaldo si falta Fecha Arqueo.
         hoja_arqueos_mf: Hoja a editar en ARQUEOS MF (0 o nombre).
+        fecha_proceso: DD_MM_YYYY del lote (respaldo de libro = mes calendario de esta fecha si falta Fecha Arqueo).
 
     Returns:
         DataFrame del archivo ARQUEOS MF después de pegar (con las filas nuevas al final).
@@ -470,15 +478,58 @@ def pegar_gestion_a_arqueos_mf(
         return lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja_arqueos_mf)
 
     df_nuevas = pd.DataFrame(filas_nuevas)
-    return _pegar_filas_a_arqueos_mf(
-        df_nuevas,
-        ruta_arqueos_mf=ruta_arqueos_mf,
-        lector=lector,
-        mes=mes,
-        anio=anio,
-        hoja_arqueos_mf=hoja_arqueos_mf,
-        etiqueta_log="filas de gestión (ARQUEO)",
-    )
+
+    def _fallback_libro_desde_proceso() -> Tuple[int, int]:
+        if fecha_proceso:
+            try:
+                _d, fm, fa = [int(p) for p in str(fecha_proceso).strip().replace("-", "_").split("_")]
+                return fm, fa
+            except Exception:
+                pass
+        if mes is not None and anio is not None:
+            return mes, anio
+        hoy = date.today()
+        return hoy.month, hoy.year
+
+    fb_m, fb_a = _fallback_libro_desde_proceso()
+    col_fa_n = _encontrar_columna(df_nuevas, ["Fecha Arqueo", "Fecha arqueo", "fecha arqueo"])
+    if col_fa_n is None:
+        return _pegar_filas_a_arqueos_mf(
+            df_nuevas,
+            ruta_arqueos_mf=ruta_arqueos_mf,
+            lector=lector,
+            mes=fb_m,
+            anio=fb_a,
+            hoja_arqueos_mf=hoja_arqueos_mf,
+            etiqueta_log="filas de gestión (ARQUEO)",
+        )
+
+    df_nuevas = df_nuevas.copy()
+    lm, la = [], []
+    for _, row in df_nuevas.iterrows():
+        fa = valor_a_fecha_celda(row.get(col_fa_n))
+        if fa is not None:
+            m0, a0 = periodo_libro_desde_fecha_arqueo(fa)
+        else:
+            m0, a0 = fb_m, fb_a
+        lm.append(m0)
+        la.append(a0)
+    df_nuevas["_lib_mf_m"] = lm
+    df_nuevas["_lib_mf_y"] = la
+
+    ultimo: Optional[pd.DataFrame] = None
+    for (_mm, _yy), chunk in df_nuevas.groupby(["_lib_mf_m", "_lib_mf_y"], sort=True):
+        chunk = chunk.drop(columns=["_lib_mf_m", "_lib_mf_y"])
+        ultimo = _pegar_filas_a_arqueos_mf(
+            chunk,
+            ruta_arqueos_mf=ruta_arqueos_mf,
+            lector=lector,
+            mes=int(_mm),
+            anio=int(_yy),
+            hoja_arqueos_mf=hoja_arqueos_mf,
+            etiqueta_log="filas de gestión (ARQUEO)",
+        )
+    return ultimo if ultimo is not None else df_nuevas
 
 
 def _parsear_fecha_dd_mm_yyyy(fecha: str):
@@ -565,12 +616,54 @@ def pegar_consolidado_a_arqueos_mf(
         except ValueError:
             pass
 
-    return _pegar_filas_a_arqueos_mf(
-        df_nuevas,
-        ruta_arqueos_mf=ruta_arqueos_mf,
-        lector=lector,
-        mes=mes,
-        anio=anio,
-        hoja_arqueos_mf=hoja_arqueos_mf,
-        etiqueta_log="filas de consolidado (multifuncional + ARQUEO)",
-    )
+    def _fallback_libro_desde_proceso_c() -> Tuple[int, int]:
+        if fecha_proceso:
+            try:
+                _d, fm, fa = [int(p) for p in str(fecha_proceso).strip().replace("-", "_").split("_")]
+                return fm, fa
+            except Exception:
+                pass
+        if mes is not None and anio is not None:
+            return mes, anio
+        hoy = date.today()
+        return hoy.month, hoy.year
+
+    fb_m, fb_a = _fallback_libro_desde_proceso_c()
+    col_fa_n = _encontrar_columna(df_nuevas, ["Fecha Arqueo", "Fecha arqueo", "fecha arqueo"])
+    if col_fa_n is None:
+        return _pegar_filas_a_arqueos_mf(
+            df_nuevas,
+            ruta_arqueos_mf=ruta_arqueos_mf,
+            lector=lector,
+            mes=fb_m,
+            anio=fb_a,
+            hoja_arqueos_mf=hoja_arqueos_mf,
+            etiqueta_log="filas de consolidado (multifuncional + ARQUEO)",
+        )
+
+    df_nuevas = df_nuevas.copy()
+    lm, la = [], []
+    for _, row in df_nuevas.iterrows():
+        fa = valor_a_fecha_celda(row.get(col_fa_n))
+        if fa is not None:
+            m0, a0 = periodo_libro_desde_fecha_arqueo(fa)
+        else:
+            m0, a0 = fb_m, fb_a
+        lm.append(m0)
+        la.append(a0)
+    df_nuevas["_lib_mf_m"] = lm
+    df_nuevas["_lib_mf_y"] = la
+
+    ultimo_c: Optional[pd.DataFrame] = None
+    for (_mm, _yy), chunk in df_nuevas.groupby(["_lib_mf_m", "_lib_mf_y"], sort=True):
+        chunk = chunk.drop(columns=["_lib_mf_m", "_lib_mf_y"])
+        ultimo_c = _pegar_filas_a_arqueos_mf(
+            chunk,
+            ruta_arqueos_mf=ruta_arqueos_mf,
+            lector=lector,
+            mes=int(_mm),
+            anio=int(_yy),
+            hoja_arqueos_mf=hoja_arqueos_mf,
+            etiqueta_log="filas de consolidado (multifuncional + ARQUEO)",
+        )
+    return ultimo_c if ultimo_c is not None else df_nuevas

@@ -57,8 +57,9 @@ class CargadorConfig:
         config = self.cargar()
         r = config.get("remanente", {})
         return {
-            "faltante_minimo_para_810291": float(r.get("faltante_minimo_para_810291", 50_000_000)),
+            "faltante_minimo_para_810291": float(r.get("faltante_minimo_para_810291", 20_000_000)),
             "faltante_limite_sobrantes": float(r.get("faltante_limite_sobrantes", 20_000_000)),
+            "sobrante_maximo_contabilizar_279510020": float(r.get("sobrante_maximo_contabilizar_279510020", 50_000_000)),
             "faltante_maximo_grabar_cuenta_faltantes": float(r.get("faltante_maximo_grabar_cuenta_faltantes", 20_000)),
             "sobrantes_incluir_dia_arqueo": bool(r.get("sobrantes_incluir_dia_arqueo", True)),
         }
@@ -85,6 +86,17 @@ class CargadorConfig:
             "activo": bool(regla.get("activo", False)),
             "limite_sobrante_negativo": float(regla.get("limite_sobrante_negativo", 1_000_000_000)),
             "limite_sobrante_medio_minimo": float(regla.get("limite_sobrante_medio_minimo", 50_000_000)),
+        }
+
+    def obtener_regla_diario_sobrante_bajo_sin_arqueo(self) -> Dict[str, Any]:
+        """
+        DIARIO sin fila ARQUEO en gestión, abs(sobrantes) en (0, limite]: calificación grabado cuadre diario.
+        """
+        config = self.cargar()
+        regla = config.get("reglas_gestion", {}).get("diario_sobrante_bajo_sin_arqueo", {})
+        return {
+            "activo": bool(regla.get("activo", False)),
+            "limite_max_abs_sobrante": float(regla.get("limite_max_abs_sobrante", 3_000_000)),
         }
 
     def obtener_config_bd(self) -> Dict[str, Any]:

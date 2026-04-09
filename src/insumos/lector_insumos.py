@@ -4,7 +4,7 @@ y archivo mensual de arqueos MF (lectura y edición).
 """
 from pathlib import Path
 from glob import glob
-from typing import Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 from datetime import datetime, date
 import shutil
 import re
@@ -12,6 +12,7 @@ import pandas as pd
 import logging
 
 from src.config.cargador_config import CargadorConfig, PROYECTO_ROOT
+from src.insumos.arqueos_mf_calendario import meses_libro_candidatos_fecha_descarga
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,9 @@ MESES_NOMBRE = (
 # Texto fijo en gestión cuando ARQUEOS MF indica cajero cuadrado (prevalece sobre otras observaciones).
 OBSERVACIONES_CUADRADO_EN_ARQUEO = "CUADRADO EN ARQUEO"
 
-# Columna de trazabilidad en Excel de gestión (solo filas DIARIO cuando aplica la regla).
-COL_PASO_A_PASO_GESTION = "paso_a_paso_regla"
+# DIARIO sin ARQUEO en gestión: sobrante bajo (parametrizable) y sin calificación previa.
+NUEVO_ESTADO_SOBRANTE_DIARIO_CONTABLES = "CONTABILIZACION SOBRANTE CONTABLES"
+OBSERVACIONES_SOBRANTE_CUADRE_DIARIO = "SE GRABA SOBRANTE DE CUADRE DIARIO."
 
 
 class LectorInsumos:
@@ -37,23 +39,24 @@ class LectorInsumos:
         self._ruta_gestion_escritura: Optional[Path] = None
 
     @staticmethod
-    def _fusionar_traza_gestion(prev: object, nuevo: str, sep: str = " | ") -> str:
-        a = str(prev if prev is not None else "").strip()
-        n = (nuevo or "").strip()
-        if not n:
-            return a
-        if not a:
-            return n
-        if n in a:
-            return a
-        return f"{a}{sep}{n}"
-
-    @staticmethod
     def _col_cajero_en_df(df: pd.DataFrame) -> Optional[str]:
         for c in df.columns:
             if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
                 return c
         return None
+
+    @staticmethod
+    def _diario_gestion_fila_tiene_calificacion(df: pd.DataFrame, idx) -> bool:
+        """True si la fila ya tiene algún valor operativo de calificación (no sobreescribir)."""
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones"):
+            if col not in df.columns:
+                continue
+            v = df.at[idx, col]
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            if str(v).strip():
+                return True
+        return False
 
     def _ruta_gestion_original_resuelta(self, fecha: Optional[str] = None) -> Path:
         """
@@ -108,6 +111,32 @@ class LectorInsumos:
             return self._ruta_gestion_escritura
         return self._ruta_gestion_original_resuelta(fecha)
 
+    def _df_arqueos_mf_union_meses_descarga(
+        self,
+        fecha_usar: str,
+        hoja_arqueos_mf: Union[str, int] = 0,
+    ) -> pd.DataFrame:
+        """
+        Concatena ARQUEOS MF de los meses candidatos a partir de la fecha de descarga/proceso
+        (mes calendario de esa fecha y mes anterior), solo si los archivos existen.
+        """
+        fd = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
+        frames = []
+        for mm, aa in meses_libro_candidatos_fecha_descarga(fd):
+            ruta = self._ruta_arqueos_mf(mm, aa)
+            if ruta.exists():
+                frames.append(
+                    self.leer_arqueos_mf(mm, aa, hoja=hoja_arqueos_mf, crear_si_falta=False)
+                )
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames, ignore_index=True)
+        col_caj = self._buscar_columna_arqueos(out, ("Cajero", "cajero"))
+        col_fa = self._buscar_columna_arqueos(out, ("Fecha Arqueo", "Fecha arqueo"))
+        if col_caj and col_fa:
+            out = out.drop_duplicates(subset=[col_caj, col_fa], keep="last")
+        return out
+
     def _directorio_insumo(self, nombre_insumo: str):
         """Directorio base para un insumo: insumo.directorio si existe, sino directorios.insumos."""
         conf = self.config.cargar()
@@ -134,6 +163,9 @@ class LectorInsumos:
         """
         En gestión: para tipo_registro DIARIO con sobrantes altos por magnitud, marcar
         columnas operativas según lineamiento contable.
+
+        Si el mismo cajero tiene fila ARQUEO en el archivo, no se aplica esta regla al DIARIO:
+        la calificación del DIARIO debe seguir al ARQUEO (reglas posteriores y sincronización).
         """
         regla = self.config.obtener_regla_diario_sobrantes()
         if not regla.get("activo", False):
@@ -147,6 +179,23 @@ class LectorInsumos:
         tipo_diario = tipo_norm.isin(["DIARIO", "DIADIO"])
         sobrantes_num = pd.to_numeric(df["sobrantes"], errors="coerce").fillna(0)
         sobrantes_abs = sobrantes_num.abs()
+
+        # DIARIO sin fila ARQUEO del mismo cajero: aquí sí aplica la regla por magnitud de sobrantes.
+        col_cajero_gestion = None
+        for c in df.columns:
+            if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
+                col_cajero_gestion = c
+                break
+        cajeros_con_arqueo: Set[int] = set()
+        if col_cajero_gestion:
+            mask_arqueo = tipo_norm == "ARQUEO"
+            for idx in df.index[mask_arqueo]:
+                try:
+                    cajeros_con_arqueo.add(int(float(df.at[idx, col_cajero_gestion])))
+                except (TypeError, ValueError):
+                    continue
+            caj_num = pd.to_numeric(df[col_cajero_gestion], errors="coerce")
+            tipo_diario = tipo_diario & ~caj_num.isin(list(cajeros_con_arqueo))
 
         mask_alto = tipo_diario & (sobrantes_abs >= limite_alto)
         mask_medio = tipo_diario & (sobrantes_abs >= limite_medio_min) & (sobrantes_abs < limite_alto)
@@ -174,8 +223,7 @@ class LectorInsumos:
         if bool(mask_medio.any()) and "cajero" in {str(c).strip().lower() for c in df.columns}:
             try:
                 fecha_usar = fecha or self.config.obtener_fecha_proceso()
-                d, m, a = [int(p) for p in str(fecha_usar).strip().replace("-", "_").split("_")]
-                df_arq = self.leer_arqueos_mf(mes=m, anio=a, hoja=0)
+                df_arq = self._df_arqueos_mf_union_meses_descarga(fecha_usar, hoja_arqueos_mf=0)
                 col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
                 col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
                 if col_cajero_arq and col_gestion_arq:
@@ -233,12 +281,8 @@ class LectorInsumos:
         mask: pd.Series,
         df: pd.DataFrame,
         hoja: Optional[str] = None,
-        paso_a_paso_etiqueta: Optional[str] = None,
     ) -> None:
-        """
-        Persiste en el archivo de gestión los campos ajustados por la regla de sobrantes extremos.
-        Si paso_a_paso_etiqueta se informa, en filas tipo DIARIO se escribe/concatena COL_PASO_A_PASO_GESTION al final de la hoja.
-        """
+        """Persiste en el archivo de gestión los campos ajustados por la regla."""
         if mask is None or not bool(mask.any()):
             return
         try:
@@ -263,16 +307,6 @@ class LectorInsumos:
         idx_sobrantes = headers_norm.get("sobrantes")
         idx_faltantes = headers_norm.get("faltantes")
 
-        idx_traza = None
-        if paso_a_paso_etiqueta:
-            k = COL_PASO_A_PASO_GESTION.strip().lower()
-            idx_traza = headers_norm.get(k)
-            if not idx_traza:
-                idx_traza = ws.max_column + 1
-                ws.cell(row=1, column=idx_traza).value = COL_PASO_A_PASO_GESTION
-                headers_norm[k] = idx_traza
-
-        col_caj_df = self._col_cajero_en_df(df)
         escritos = 0
         for idx in mask[mask].index:
             excel_row = int(idx) + 2  # +1 por encabezado y +1 por índice 0-based
@@ -292,21 +326,6 @@ class LectorInsumos:
                 ws.cell(row=excel_row, column=idx_sobrantes).value = df.at[idx, "sobrantes"]
             if idx_faltantes and "faltantes" in df.columns:
                 ws.cell(row=excel_row, column=idx_faltantes).value = df.at[idx, "faltantes"]
-
-            if idx_traza and "tipo_registro" in df.columns:
-                tipo = str(df.at[idx, "tipo_registro"]).strip().upper()
-                if tipo in ("DIARIO", "DIADIO"):
-                    partes = [paso_a_paso_etiqueta or ""]
-                    if col_caj_df:
-                        partes.append(f"cajero={df.at[idx, col_caj_df]}")
-                    if "sobrantes" in df.columns:
-                        partes.append(f"sobrantes={df.at[idx, 'sobrantes']}")
-                    for cn in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones"):
-                        if cn in df.columns:
-                            partes.append(f"{cn}={df.at[idx, cn]}")
-                    nuevo_txt = " | ".join(p for p in partes if p)
-                    prev_v = ws.cell(row=excel_row, column=idx_traza).value
-                    ws.cell(row=excel_row, column=idx_traza).value = self._fusionar_traza_gestion(prev_v, nuevo_txt)
 
             escritos += 1
 
@@ -348,30 +367,10 @@ class LectorInsumos:
             logger.warning("No hay columna 'observaciones' en gestión; no se persiste CUADRADO EN ARQUEO.")
             return
 
-        k_tr = COL_PASO_A_PASO_GESTION.strip().lower()
-        idx_traza = headers_norm.get(k_tr)
-        if not idx_traza:
-            idx_traza = ws.max_column + 1
-            ws.cell(row=1, column=idx_traza).value = COL_PASO_A_PASO_GESTION
-
-        col_caj_df = self._col_cajero_en_df(df)
         escritos = 0
         for idx in mask[mask].index:
             excel_row = int(idx) + 2
             ws.cell(row=excel_row, column=idx_obs).value = df.at[idx, "observaciones"]
-            if "tipo_registro" in df.columns:
-                tipo = str(df.at[idx, "tipo_registro"]).strip().upper()
-                if tipo in ("DIARIO", "DIADIO"):
-                    partes = [
-                        "CUADRADO_EN_ARQUEO",
-                        "observaciones_forzadas_desde_ARQUEOS_MF",
-                        f"valor_obs={OBSERVACIONES_CUADRADO_EN_ARQUEO}",
-                    ]
-                    if col_caj_df:
-                        partes.insert(2, f"cajero={df.at[idx, col_caj_df]}")
-                    nuevo_txt = " | ".join(partes)
-                    prev_v = ws.cell(row=excel_row, column=idx_traza).value
-                    ws.cell(row=excel_row, column=idx_traza).value = self._fusionar_traza_gestion(prev_v, nuevo_txt)
             escritos += 1
 
         try:
@@ -402,12 +401,11 @@ class LectorInsumos:
     def _cajeros_cuadrado_mf_en_fecha_descarga(
         self,
         fecha_descarga: date,
-        mes: int,
-        anio: int,
-        hoja_arqueos_mf: Union[str, int] = 0,
+        df_arq: pd.DataFrame,
     ) -> Set[int]:
         """Códigos de cajero con fila en ARQUEOS MF: fecha descarga = fecha y gestión = cuadrado."""
-        df_arq = self.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja_arqueos_mf)
+        if df_arq is None or df_arq.empty:
+            return set()
         col_cajero = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
         col_fecha = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
         col_gestion = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
@@ -433,19 +431,22 @@ class LectorInsumos:
         hoja_arqueos_mf: Union[str, int] = 0,
     ) -> pd.Series:
         """
-        Para cada fila de gestión cuyo cajero está cuadrado en ARQUEOS MF (misma fecha descarga),
-        asigna observaciones = CUADRADO EN ARQUEO. Devuelve máscara de filas modificadas.
+        Para cada fila de gestión cuyo cajero está cuadrado en ARQUEOS MF (fecha descarga = proceso):
+        ARQUEO y DIARIO quedan con la misma calificación operativa:
+        - ratificar_grabar_diferencia = No
+        - justificacion = Contable
+        - nuevo_estado = ERROR EN TRANSMISION DE CONTADORES
+        - observaciones = CUADRADO EN ARQUEO
         """
         fecha_desc = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
-        cajeros = self._cajeros_cuadrado_mf_en_fecha_descarga(
-            fecha_desc, fecha_desc.month, fecha_desc.year, hoja_arqueos_mf
-        )
+        df_arq_union = self._df_arqueos_mf_union_meses_descarga(fecha_usar, hoja_arqueos_mf=hoja_arqueos_mf)
+        cajeros = self._cajeros_cuadrado_mf_en_fecha_descarga(fecha_desc, df_arq_union)
         if not cajeros:
             return pd.Series(False, index=df_gestion.index)
 
         col_cajero_gestion = None
         for c in df_gestion.columns:
-            if str(c).strip().lower() in ("cajero", "codigo_cajero"):
+            if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
                 col_cajero_gestion = c
                 break
         if not col_cajero_gestion or "observaciones" not in df_gestion.columns:
@@ -456,8 +457,18 @@ class LectorInsumos:
         if not bool(mask.any()):
             return mask
 
-        df_gestion["observaciones"] = df_gestion["observaciones"].astype("object")
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones", "grabar"):
+            if col in df_gestion.columns:
+                df_gestion[col] = df_gestion[col].astype("object")
         df_gestion.loc[mask, "observaciones"] = OBSERVACIONES_CUADRADO_EN_ARQUEO
+        if "ratificar_grabar_diferencia" in df_gestion.columns:
+            df_gestion.loc[mask, "ratificar_grabar_diferencia"] = "No"
+        if "justificacion" in df_gestion.columns:
+            df_gestion.loc[mask, "justificacion"] = "Contable"
+        if "nuevo_estado" in df_gestion.columns:
+            df_gestion.loc[mask, "nuevo_estado"] = "ERROR EN TRANSMISION DE CONTADORES"
+        if "grabar" in df_gestion.columns:
+            df_gestion.loc[mask, "grabar"] = "No"
         return mask
 
     def aplicar_observaciones_cuadrado_desde_arqueos_mf(
@@ -468,8 +479,9 @@ class LectorInsumos:
     ) -> int:
         """
         Si en ARQUEOS MF (Fecha descarga arqueo = fecha de proceso) la Gestión a Realizar es
-        cajero cuadrado, en el archivo de gestión se fuerza observaciones = CUADRADO EN ARQUEO
-        (todas las filas de ese cajero: DIARIO y ARQUEO).
+        cajero cuadrado, en gestión (ARQUEO y DIARIO de ese cajero) se fijan operativamente:
+        ratificar No, justificación Contable, nuevo_estado ERROR EN TRANSMISION DE CONTADORES,
+        observaciones CUADRADO EN ARQUEO.
 
         Debe ejecutarse al final del flujo para prevalecer sobre otras reglas de observaciones.
         """
@@ -488,12 +500,177 @@ class LectorInsumos:
         mask = self._aplicar_observaciones_cuadrado_en_df(df_gestion, fecha_usar, hoja_arqueos_mf=hoja_arqueos_mf)
         if not bool(mask.any()):
             return 0
-        self._persistir_solo_observaciones_gestion(ruta, mask, df_gestion, hoja=hoja_gestion)
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask,
+            df_gestion,
+            hoja=hoja_gestion,
+        )
         logger.info(
             "Regla observaciones CUADRADO EN ARQUEO: %d fila(s) en gestión (según ARQUEOS MF fecha descarga).",
             int(mask.sum()),
         )
         return int(mask.sum())
+
+    def sincronizar_observaciones_diario_desde_arqueo(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+    ) -> int:
+        """
+        Si un cajero tiene fila ARQUEO y fila DIARIO/DIADIO, copia **observaciones** desde ARQUEO
+        hacia DIARIO. No copia ratificar/justificación/nuevo_estado: la regla de grabar 279510020
+        define valores distintos en ARQUEO vs DIARIO a propósito.
+
+        Se ejecuta al final del flujo para alinear el texto de calificación cuando el DIARIO
+        no debió calificarse por la regla independiente de sobrantes (pareja ARQUEO+DIARIO).
+        """
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning("No se encontró gestión para %s; no se sincronizan observaciones DIARIO.", fecha_usar)
+            return 0
+
+        if hoja_gestion:
+            df_gestion = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df_gestion = pd.read_excel(ruta, engine="openpyxl")
+
+        if "tipo_registro" not in df_gestion.columns or "observaciones" not in df_gestion.columns:
+            return 0
+
+        col_cajero_gestion = None
+        for c in df_gestion.columns:
+            if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
+                col_cajero_gestion = c
+                break
+        if not col_cajero_gestion:
+            return 0
+
+        tipo_norm = df_gestion["tipo_registro"].astype(str).str.strip().str.upper()
+        caj_num = pd.to_numeric(df_gestion[col_cajero_gestion], errors="coerce")
+        mask_arq = tipo_norm == "ARQUEO"
+        mask_di = tipo_norm.isin(["DIARIO", "DIADIO"])
+        if not bool(mask_arq.any()) or not bool(mask_di.any()):
+            return 0
+
+        mask_mod = pd.Series(False, index=df_gestion.index)
+        for caj in caj_num[mask_arq].dropna().unique():
+            try:
+                icaj = int(float(caj))
+            except (TypeError, ValueError):
+                continue
+            idx_arq = df_gestion.index[(caj_num == icaj) & mask_arq]
+            idx_di = df_gestion.index[(caj_num == icaj) & mask_di]
+            if len(idx_arq) == 0 or len(idx_di) == 0:
+                continue
+            src = idx_arq[0]
+            val_obs = df_gestion.at[src, "observaciones"]
+            for did in idx_di:
+                df_gestion.at[did, "observaciones"] = val_obs
+                mask_mod.at[did] = True
+
+        if not bool(mask_mod.any()):
+            return 0
+
+        df_gestion["observaciones"] = df_gestion["observaciones"].astype("object")
+        self._persistir_solo_observaciones_gestion(ruta, mask_mod, df_gestion, hoja=hoja_gestion)
+        logger.info(
+            "Observaciones DIARIO alineadas desde ARQUEO: %d fila(s).",
+            int(mask_mod.sum()),
+        )
+        return int(mask_mod.sum())
+
+    def aplicar_regla_diario_sobrante_bajo_sin_arqueo(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+    ) -> int:
+        """
+        Tras las reglas que acoplan DIARIO con ARQUEO (y sincronización de observaciones):
+        filas **solo DIARIO** (sin fila ARQUEO del mismo cajero en el archivo) con
+        0 < abs(sobrantes) <= límite (config) reciben la calificación de grabado de sobrante
+        de cuadre diario, salvo que la fila **ya** tenga algún valor en ratificar/justificación/
+        nuevo_estado/observaciones.
+        """
+        regla = self.config.obtener_regla_diario_sobrante_bajo_sin_arqueo()
+        if not regla.get("activo", False):
+            return 0
+        limite = float(regla.get("limite_max_abs_sobrante", 3_000_000))
+
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning(
+                "No se encontró gestión para %s; no se aplica regla DIARIO sobrante bajo sin ARQUEO.",
+                fecha_usar,
+            )
+            return 0
+
+        if hoja_gestion:
+            df = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df = pd.read_excel(ruta, engine="openpyxl")
+
+        if "tipo_registro" not in df.columns or "sobrantes" not in df.columns:
+            return 0
+
+        col_cajero = self._col_cajero_en_df(df)
+        if not col_cajero:
+            return 0
+
+        tipo_norm = df["tipo_registro"].astype(str).str.strip().str.upper()
+        mask_diario = tipo_norm.isin(["DIARIO", "DIADIO"])
+
+        cajeros_con_arqueo: Set[int] = set()
+        for idx in df.index[tipo_norm == "ARQUEO"]:
+            try:
+                cajeros_con_arqueo.add(int(float(df.at[idx, col_cajero])))
+            except (TypeError, ValueError):
+                continue
+
+        caj_num = pd.to_numeric(df[col_cajero], errors="coerce")
+        mask_sin_par_arqueo = mask_diario & ~caj_num.isin(list(cajeros_con_arqueo))
+
+        sobrantes_num = pd.to_numeric(df["sobrantes"], errors="coerce")
+        sobrantes_abs = sobrantes_num.abs()
+        mask_monto = (sobrantes_abs > 0) & (sobrantes_abs <= limite)
+        mask_candidatas = mask_sin_par_arqueo & mask_monto
+
+        idxs_aplicar = [
+            idx for idx in df.index[mask_candidatas] if not self._diario_gestion_fila_tiene_calificacion(df, idx)
+        ]
+        if not idxs_aplicar:
+            return 0
+
+        mask_aplicar = pd.Series(False, index=df.index)
+        mask_aplicar.loc[idxs_aplicar] = True
+
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones", "grabar"):
+            if col in df.columns:
+                df[col] = df[col].astype("object")
+
+        df.loc[mask_aplicar, "ratificar_grabar_diferencia"] = "Si"
+        df.loc[mask_aplicar, "justificacion"] = "Contable"
+        df.loc[mask_aplicar, "nuevo_estado"] = NUEVO_ESTADO_SOBRANTE_DIARIO_CONTABLES
+        df.loc[mask_aplicar, "observaciones"] = OBSERVACIONES_SOBRANTE_CUADRE_DIARIO
+        if "grabar" in df.columns:
+            df.loc[mask_aplicar, "grabar"] = "Si"
+
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask_aplicar,
+            df,
+            hoja=hoja_gestion,
+        )
+        logger.info(
+            "Regla DIARIO sobrante bajo sin ARQUEO (abs<= %.0f, excl. ya calificados): %d fila(s).",
+            limite,
+            int(mask_aplicar.sum()),
+        )
+        return int(mask_aplicar.sum())
 
     def _parsear_fecha_dd_mm_yyyy(self, fecha: str) -> date:
         """Convierte DD_MM_YYYY a date."""
@@ -510,11 +687,11 @@ class LectorInsumos:
         hoja_arqueos_mf: Union[str, int] = 0,
     ) -> int:
         """
-        Sincroniza en archivo de gestión (tipo_registro=ARQUEO) el caso donde
-        en ARQUEOS MF para el mismo cajero la columna "Gestión a Realizar" indica
-        "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO".
+        Sincroniza en archivo de gestión (ARQUEO y DIARIO del mismo cajero) cuando
+        en ARQUEOS MF la columna "Gestión a Realizar" indica
+        "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO" (fecha descarga = proceso).
 
-        Regla:
+        Regla (misma calificación en ARQUEO, DIARIO y DIADIO):
         - ratificar_grabar_diferencia = "No"
         - justificacion = "Contable"
         - nuevo_estado = "ERROR EN TRANSMISION DE CONTADORES"
@@ -525,7 +702,6 @@ class LectorInsumos:
         """
         fecha_usar = fecha or self.config.obtener_fecha_proceso()
         fecha_descarga = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
-        d, m, a = fecha_descarga.day, fecha_descarga.month, fecha_descarga.year
 
         try:
             ruta = self._ruta_gestion_para_escritura(fecha_usar)
@@ -543,12 +719,10 @@ class LectorInsumos:
             return 0
 
         tipo_norm = df_gestion["tipo_registro"].astype(str).str.strip().str.upper()
-        mask_arqueo_gestion = tipo_norm == "ARQUEO"
-        if not bool(mask_arqueo_gestion.any()):
-            return 0
+        mask_arqueo_o_diario = tipo_norm.isin(["ARQUEO", "DIARIO", "DIADIO"])
 
-        # Leer ARQUEOS MF ya actualizado
-        df_arq = self.leer_arqueos_mf(mes=m, anio=a, hoja=hoja_arqueos_mf)
+        # ARQUEOS MF: unión de libros candidatos (cruce mes descarga / mes arqueo)
+        df_arq = self._df_arqueos_mf_union_meses_descarga(fecha_usar, hoja_arqueos_mf=hoja_arqueos_mf)
         col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
         col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
         col_fecha_descarga_arq = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
@@ -556,6 +730,9 @@ class LectorInsumos:
         col_traza_arq = self._buscar_columna_arqueos(df_arq, ("paso_a_paso_regla",))
         if not (col_cajero_arq and col_gestion_arq and col_fecha_descarga_arq):
             logger.warning("ARQUEOS MF no tiene columnas necesarias para aplicar la regla ARQUEO.")
+            return 0
+
+        if df_arq.empty:
             return 0
 
         # Filtrar por la fecha de descarga indicada (para no arrastrar reglas de días anteriores)
@@ -593,11 +770,9 @@ class LectorInsumos:
         if not col_cajero_gestion:
             return 0
 
-        # Crear máscara final: solo tipo ARQUEO y cajero presente en ARQUEOS MF con aclarar/repetir
-        mask_final = mask_arqueo_gestion.copy()
-        # Evitar iteraciones caras: convertir a numérico y filtrar
+        # Misma calificación en ARQUEO y DIARIO (y DIADIO) para el cajero con ACLARAR en ARQUEOS MF
         caj_num = pd.to_numeric(df_gestion[col_cajero_gestion], errors="coerce")
-        mask_final = mask_final & caj_num.isin(list(cajeros))
+        mask_final = mask_arqueo_o_diario & caj_num.isin(list(cajeros))
         if not bool(mask_final.any()):
             return 0
 
@@ -618,7 +793,7 @@ class LectorInsumos:
 
         # Persistir los cambios
         self._persistir_regla_diario_sobrantes_en_excel(ruta, mask_final, df_gestion, hoja=hoja_gestion)
-        logger.info("Regla ARQUEO aclarar/sucursal persistida: %d fila(s).", int(mask_final.sum()))
+        logger.info("Regla aclarar/sucursal (ARQUEO+DIARIO) persistida: %d fila(s).", int(mask_final.sum()))
         return int(mask_final.sum())
 
     def aplicar_regla_grabar_sobrante_desde_arqueos_mf(
@@ -650,7 +825,6 @@ class LectorInsumos:
 
         fecha_usar = fecha or self.config.obtener_fecha_proceso()
         fecha_descarga = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
-        m, a = fecha_descarga.month, fecha_descarga.year
 
         try:
             ruta = self._ruta_gestion_para_escritura(fecha_usar)
@@ -665,8 +839,8 @@ class LectorInsumos:
         if "tipo_registro" not in df_gestion.columns:
             return 0
 
-        # Leer ARQUEOS MF y detectar cajeros con texto de "grabar sobrante"
-        df_arq = self.leer_arqueos_mf(mes=m, anio=a, hoja=hoja_arqueos_mf)
+        # ARQUEOS MF (unión mes descarga / anterior)
+        df_arq = self._df_arqueos_mf_union_meses_descarga(fecha_usar, hoja_arqueos_mf=hoja_arqueos_mf)
         col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
         col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
         col_fecha_descarga_arq = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
@@ -676,30 +850,56 @@ class LectorInsumos:
             logger.warning("ARQUEOS MF no tiene columnas necesarias para regla grabar sobrante.")
             return 0
 
+        if df_arq.empty:
+            return 0
+
         fechas_desc = pd.to_datetime(df_arq[col_fecha_descarga_arq], errors="coerce").dt.date
         mask_fecha = fechas_desc == fecha_descarga
 
-        def _es_texto_grabar_sobrante(v: object) -> bool:
-            txt = str(v or "").strip().upper()
-            if not txt:
-                return False
-            return (
-                "GERENCIA DE AUTOSERVICIOS Y EFECTIVO" in txt
-                and "279510020" in txt
-                and "DIFERENCIA" in txt
-                and "CONTABILIZADA" in txt
-            )
+        def _parsear_diferencia_desde_traza(txt: object) -> Optional[float]:
+            t = str(txt or "")
+            m_dif = re.search(r"diferencia_actual=\$(-?[0-9\.]+)", t)
+            if not m_dif:
+                return None
+            try:
+                return float(m_dif.group(1).replace(".", ""))
+            except (TypeError, ValueError):
+                return None
 
-        mask_grabar = mask_fecha & df_arq[col_gestion_arq].apply(_es_texto_grabar_sobrante)
-        if not bool(mask_grabar.any()):
+        # Filtrar cajeros ARQUEO MF que realmente quedaron en contabilización de sobrante 279510020.
+        # Esta lista es la fuente de verdad para sincronizar la calificación en gestión.
+        txt_gestion = df_arq[col_gestion_arq].astype(str).str.strip().str.lower()
+        mask_graba_sobrante = txt_gestion.str.contains("cuenta de sobrantes 279510020", na=False)
+        mask_candidatos = mask_fecha & mask_graba_sobrante
+        if not bool(mask_candidatos.any()):
             return 0
 
+        # Para la fecha dada, usar la diferencia de ARQUEOS MF si existe
+        # (desde columna Diferencia o fallback desde paso_a_paso_regla) solo en los cajeros candidatos.
+        dif_por_cajero = {}
         cajeros_objetivo = set()
-        for v in df_arq.loc[mask_grabar, col_cajero_arq].tolist():
+        cols_arq = [col_cajero_arq]
+        if col_diferencia_arq:
+            cols_arq.append(col_diferencia_arq)
+        if col_traza_arq:
+            cols_arq.append(col_traza_arq)
+        for _, r in df_arq.loc[mask_candidatos, cols_arq].iterrows():
             try:
-                cajeros_objetivo.add(int(float(v)))
+                caj = int(float(r[col_cajero_arq]))
             except (TypeError, ValueError):
                 continue
+            cajeros_objetivo.add(caj)
+            dif = None
+            if col_diferencia_arq and pd.notna(r.get(col_diferencia_arq)):
+                try:
+                    dif = float(r.get(col_diferencia_arq))
+                except (TypeError, ValueError):
+                    dif = None
+            if dif is None and col_traza_arq:
+                dif = _parsear_diferencia_desde_traza(r.get(col_traza_arq))
+            if dif is not None:
+                dif_por_cajero[caj] = dif
+
         if not cajeros_objetivo:
             return 0
 
@@ -744,36 +944,11 @@ class LectorInsumos:
             # En DIARIO prima la misma observación que ARQUEO para el cajero.
             df_gestion.loc[mask_final, "observaciones"] = "SE GRABA SOBRANTE DE ARQUEO"
 
-        # Copiar la diferencia encontrada en ARQUEOS MF a columnas de gestión:
+        # Copiar siempre la diferencia final de ARQUEOS MF a gestión en ARQUEO y DIARIO.
         # - diferencia <= 0: sobrantes=dif, faltantes=0
         # - diferencia > 0:  faltantes=dif, sobrantes=0
-        if col_diferencia_arq and ("sobrantes" in df_gestion.columns or "faltantes" in df_gestion.columns):
-            def _parsear_diferencia_desde_traza(txt: object) -> Optional[float]:
-                t = str(txt or "")
-                m_dif = re.search(r"diferencia_actual=\$(-?[0-9\.]+)", t)
-                if not m_dif:
-                    return None
-                try:
-                    return float(m_dif.group(1).replace(".", ""))
-                except (TypeError, ValueError):
-                    return None
-
-            dif_por_cajero = {}
-            cols_arq = [col_cajero_arq, col_diferencia_arq]
-            if col_traza_arq:
-                cols_arq.append(col_traza_arq)
-            for _, r in df_arq.loc[mask_grabar, cols_arq].iterrows():
-                try:
-                    caj = int(float(r[col_cajero_arq]))
-                    dif = float(r[col_diferencia_arq]) if pd.notna(r[col_diferencia_arq]) else None
-                    if dif is None and col_traza_arq:
-                        dif = _parsear_diferencia_desde_traza(r.get(col_traza_arq))
-                    if dif is not None:
-                        # Si hay más de una fila para el cajero, conservar la última del dataframe filtrado.
-                        dif_por_cajero[caj] = dif
-                except (TypeError, ValueError):
-                    continue
-            for idx in df_gestion[mask_final_arqueo].index:
+        if "sobrantes" in df_gestion.columns or "faltantes" in df_gestion.columns:
+            for idx in df_gestion[mask_final].index:
                 try:
                     caj = int(float(df_gestion.at[idx, col_cajero_gestion]))
                 except (TypeError, ValueError):
@@ -790,7 +965,6 @@ class LectorInsumos:
             mask_final,
             df_gestion,
             hoja=hoja_gestion,
-            paso_a_paso_etiqueta="Grabar_sobrante_279510020_ARQUEOS_MF",
         )
         logger.info(
             "Regla grabar sobrante desde ARQUEOS MF persistida: %d fila(s) [ARQUEO=%d, DIARIO=%d].",
@@ -830,11 +1004,15 @@ class LectorInsumos:
                 mask_regla,
                 df=df,
                 hoja=hoja,
-                paso_a_paso_etiqueta="DIARIO_sobrantes_extremos",
             )
         mask_cuad = self._aplicar_observaciones_cuadrado_en_df(df, fecha_usar, hoja_arqueos_mf=0)
         if bool(mask_cuad.any()):
-            self._persistir_solo_observaciones_gestion(ruta, mask_cuad, df, hoja=hoja)
+            self._persistir_regla_diario_sobrantes_en_excel(
+                ruta,
+                mask_cuad,
+                df,
+                hoja=hoja,
+            )
         logger.info(f"Filas: {len(df)}, columnas: {len(df.columns)}")
         return df
 
@@ -898,11 +1076,95 @@ class LectorInsumos:
         directorio = self._directorio_insumo("arqueos_mf")
         return directorio / nombre
 
+    def _rutas_plantilla_arqueos_mf(self, mes_objetivo: int, anio_objetivo: int) -> List[Path]:
+        """
+        Archivos existentes para clonar estructura (hojas y columnas), en orden de preferencia:
+        mes anterior, luego cualquier ARQUEOS MF en el directorio (más reciente primero).
+        """
+        directorio = self._directorio_insumo("arqueos_mf")
+        ruta_obj = self._ruta_arqueos_mf(mes_objetivo, anio_objetivo)
+        ordered: List[Path] = []
+        seen: Set[Path] = set()
+
+        def add(p: Path) -> None:
+            if not p.exists() or p.resolve() == ruta_obj.resolve():
+                return
+            rp = p.resolve()
+            if rp in seen:
+                return
+            seen.add(rp)
+            ordered.append(p)
+
+        if mes_objetivo > 1:
+            add(self._ruta_arqueos_mf(mes_objetivo - 1, anio_objetivo))
+        else:
+            add(self._ruta_arqueos_mf(12, anio_objetivo - 1))
+        try:
+            candidatos = sorted(
+                [p for p in directorio.glob("*.xlsx") if "procesado" not in p.stem.lower()],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            candidatos = []
+        for p in candidatos:
+            n = p.name.upper()
+            if "ARQUEOS" in n and "MF" in n:
+                add(p)
+        return ordered
+
+    def _crear_arqueos_mf_desde_referencia(self, ruta_destino: Path, ruta_referencia: Path) -> None:
+        """Nuevo libro vacío: mismas hojas y columnas que la referencia (solo encabezados, sin filas)."""
+        ruta_destino.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelFile(ruta_referencia, engine="openpyxl") as xl:
+            nombres = xl.sheet_names
+        if not nombres:
+            raise ValueError(f"La plantilla no tiene hojas: {ruta_referencia}")
+        with pd.ExcelWriter(ruta_destino, engine="openpyxl") as writer:
+            for nombre in nombres:
+                df_head = pd.read_excel(ruta_referencia, sheet_name=nombre, engine="openpyxl", nrows=0)
+                vacio = pd.DataFrame(columns=df_head.columns)
+                vacio.to_excel(writer, sheet_name=nombre, index=False)
+
+    def asegurar_archivo_arqueos_mf(self, mes: int, anio: int) -> bool:
+        """
+        Si el ARQUEOS MF del mes/año no existe, crea un Excel vacío en el mismo directorio
+        con las mismas hojas y columnas que un archivo ARQUEOS MF de referencia.
+
+        Returns:
+            True si se creó el archivo, False si ya existía.
+
+        Raises:
+            FileNotFoundError si no hay ningún ARQUEOS MF en el directorio para usar como plantilla.
+        """
+        if mes is None or anio is None:
+            raise ValueError("asegurar_archivo_arqueos_mf requiere mes y anio explícitos")
+        ruta = self._ruta_arqueos_mf(mes=mes, anio=anio)
+        if ruta.exists():
+            return False
+        for ref in self._rutas_plantilla_arqueos_mf(mes, anio):
+            try:
+                self._crear_arqueos_mf_desde_referencia(ruta, ref)
+                logger.info(
+                    "Creado insumo ARQUEOS MF vacío: %s (columnas según plantilla %s).",
+                    ruta.name,
+                    ref.name,
+                )
+                return True
+            except Exception as e:
+                logger.warning("No se pudo generar ARQUEOS MF desde plantilla %s: %s", ref.name, e)
+                continue
+        raise FileNotFoundError(
+            f"No existe {ruta.name} y no hay un ARQUEOS MF válido en "
+            f"{ruta.parent} para copiar la estructura de columnas."
+        )
+
     def leer_arqueos_mf(
         self,
         mes: Optional[int] = None,
         anio: Optional[int] = None,
         hoja: Optional[Union[str, int]] = None,
+        crear_si_falta: bool = True,
     ) -> pd.DataFrame:
         """
         Lee el archivo mensual de arqueos MF (ej: 02- ARQUEOS MF FEBRERO 2026.xlsx).
@@ -911,13 +1173,25 @@ class LectorInsumos:
             mes: Número de mes 1-12. Si None, mes actual.
             anio: Año (ej: 2026). Si None, año actual.
             hoja: Nombre o índice de hoja. Si None, primera hoja.
+            crear_si_falta: Si True y el archivo no existe, crea uno vacío con las mismas hojas/columnas
+                que otro ARQUEOS MF del directorio.
 
         Returns:
             DataFrame con el contenido de la hoja.
         """
+        if mes is None or anio is None:
+            hoy = datetime.now()
+            mes = mes if mes is not None else hoy.month
+            anio = anio if anio is not None else hoy.year
         ruta = self._ruta_arqueos_mf(mes=mes, anio=anio)
         if not ruta.exists():
-            raise FileNotFoundError(f"No se encontró el archivo: {ruta}")
+            if crear_si_falta:
+                try:
+                    self.asegurar_archivo_arqueos_mf(mes, anio)
+                except FileNotFoundError:
+                    raise FileNotFoundError(f"No se encontró el archivo: {ruta}") from None
+            else:
+                raise FileNotFoundError(f"No se encontró el archivo: {ruta}")
         logger.info("Leyendo arqueos MF: %s", ruta)
         if hoja is not None:
             df = pd.read_excel(ruta, sheet_name=hoja, engine="openpyxl")
@@ -971,6 +1245,14 @@ class LectorInsumos:
             Path del archivo guardado.
         """
         ruta = self._ruta_arqueos_mf(mes=mes, anio=anio)
+        if not ruta.exists():
+            hoy = datetime.now()
+            mm = mes if mes is not None else hoy.month
+            yy = anio if anio is not None else hoy.year
+            try:
+                self.asegurar_archivo_arqueos_mf(mm, yy)
+            except FileNotFoundError:
+                pass
         if ruta.exists():
             # Leer todas las hojas, reemplazar la indicada y volver a escribir
             with pd.ExcelFile(ruta, engine="openpyxl") as xl:
@@ -1006,36 +1288,48 @@ class LectorInsumos:
     ) -> int:
         """
         Borra del ARQUEOS MF todas las filas donde "Fecha descarga arqueo" = fecha_filtro.
-        Útil para resetear lo del día y volver a pegar (flujo completo).
+        Revisa los libros mensuales candidatos (mes de la fecha y mes anterior). mes/anio se ignoran.
 
         Returns:
-            Número de filas eliminadas.
+            Número total de filas eliminadas.
         """
-        df = self.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
-        col = self._buscar_columna_arqueos(df, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
-        if not col:
-            logger.warning("No se encontró columna 'Fecha descarga arqueo'; no se puede hacer reset.")
-            return 0
+        total = 0
+        for mm, aa in meses_libro_candidatos_fecha_descarga(fecha_filtro):
+            ruta = self._ruta_arqueos_mf(mm, aa)
+            if not ruta.exists():
+                continue
+            df = self.leer_arqueos_mf(mes=mm, anio=aa, hoja=hoja)
+            col = self._buscar_columna_arqueos(df, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
+            if not col:
+                logger.warning("No se encontró columna 'Fecha descarga arqueo'; no se puede hacer reset en %s.", ruta.name)
+                continue
 
-        def valor_a_fecha(val):
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                return None
-            if isinstance(val, date) and not isinstance(val, datetime):
-                return val
-            if isinstance(val, datetime):
-                return val.date()
-            try:
-                dt = pd.to_datetime(val)
-                return dt.date() if hasattr(dt, "date") else dt
-            except Exception:
-                return None
+            def valor_a_fecha(val):
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return None
+                if isinstance(val, date) and not isinstance(val, datetime):
+                    return val
+                if isinstance(val, datetime):
+                    return val.date()
+                try:
+                    dt = pd.to_datetime(val)
+                    return dt.date() if hasattr(dt, "date") else dt
+                except Exception:
+                    return None
 
-        mask = df[col].apply(lambda v: valor_a_fecha(v) == fecha_filtro)
-        n_quitar = int(mask.sum())
-        if n_quitar == 0:
-            logger.info("Reset ARQUEOS MF: no hay filas con Fecha descarga arqueo = %s.", fecha_filtro)
-            return 0
-        df_nuevo = df[~mask].copy()
-        self.guardar_arqueos_mf(df_nuevo, mes=mes, anio=anio, hoja=hoja)
-        logger.info("Reset ARQUEOS MF: eliminadas %d fila(s) con Fecha descarga arqueo = %s.", n_quitar, fecha_filtro)
-        return n_quitar
+            mask = df[col].apply(lambda v: valor_a_fecha(v) == fecha_filtro)
+            n_quitar = int(mask.sum())
+            if n_quitar == 0:
+                continue
+            df_nuevo = df[~mask].copy()
+            self.guardar_arqueos_mf(df_nuevo, mes=mm, anio=aa, hoja=hoja)
+            logger.info(
+                "Reset ARQUEOS MF (%s): eliminadas %d fila(s) con Fecha descarga arqueo = %s.",
+                ruta.name,
+                n_quitar,
+                fecha_filtro,
+            )
+            total += n_quitar
+        if total == 0:
+            logger.info("Reset ARQUEOS MF: no hay filas con Fecha descarga arqueo = %s en libros candidatos.", fecha_filtro)
+        return total

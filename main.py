@@ -43,34 +43,40 @@ def _fecha_str_a_date(fecha: str) -> date:
     return date(a, m, d)
 
 
-def _existen_registros_fecha_descarga_hoy(lector: LectorInsumos, fecha: str, mes: int, anio: int, hoja) -> bool:
+def _existen_registros_fecha_descarga_hoy(lector: LectorInsumos, fecha: str, hoja) -> bool:
     """
-    Verifica si ARQUEOS MF ya contiene filas con "Fecha descarga arqueo" igual a la fecha indicada.
-    Si existen, se debe omitir el copiado de insumos (gestión/consolidado).
+    Verifica si algún ARQUEOS MF candidato (mes de la fecha de proceso y mes anterior) ya contiene
+    filas con "Fecha descarga arqueo" igual a la fecha indicada.
     """
     import pandas as pd
 
+    from src.insumos.arqueos_mf_calendario import meses_libro_candidatos_fecha_descarga
+
     fecha_obj = _fecha_str_a_date(fecha)
-    df_arq = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
-
-    col_fecha_descarga = None
-    for c in df_arq.columns:
-        n = str(c).strip().lower()
-        if n in ("fecha descarga arqueo", "fecha_descarga_arqueo", "fecha descarga arqueo "):
-            col_fecha_descarga = c
-            break
-    if col_fecha_descarga is None:
-        logger.warning("No se encontró columna 'Fecha descarga arqueo' en ARQUEOS MF; se continuará con copiado.")
-        return False
-
-    fechas = pd.to_datetime(df_arq[col_fecha_descarga], errors="coerce").dt.date
-    existe = bool((fechas == fecha_obj).any())
-    if existe:
-        logger.info(
-            "ARQUEOS MF ya tiene registros con Fecha descarga arqueo = %s. Se omite copiado de gestión y consolidado.",
-            fecha,
-        )
-    return existe
+    for mes, anio in meses_libro_candidatos_fecha_descarga(fecha_obj):
+        try:
+            df_arq = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja, crear_si_falta=False)
+        except FileNotFoundError:
+            continue
+        col_fecha_descarga = None
+        for c in df_arq.columns:
+            n = str(c).strip().lower()
+            if n in ("fecha descarga arqueo", "fecha_descarga_arqueo", "fecha descarga arqueo "):
+                col_fecha_descarga = c
+                break
+        if col_fecha_descarga is None:
+            continue
+        fechas = pd.to_datetime(df_arq[col_fecha_descarga], errors="coerce").dt.date
+        if bool((fechas == fecha_obj).any()):
+            logger.info(
+                "ARQUEOS MF (%02d-%04d) ya tiene registros con Fecha descarga arqueo = %s. Se omite copiado de gestión y consolidado.",
+                mes,
+                anio,
+                fecha,
+            )
+            return True
+    logger.debug("Ningún libro ARQUEOS MF candidato tiene aún Fecha descarga arqueo = %s.", fecha)
+    return False
 
 
 def main(
@@ -179,7 +185,7 @@ def main(
                 pegar_consolidado = False
 
         # Nueva regla: si ya existen filas con Fecha descarga arqueo = fecha_usar, no volver a copiar.
-        if _existen_registros_fecha_descarga_hoy(lector, fecha_usar, mes_usar, anio_usar, hoja):
+        if _existen_registros_fecha_descarga_hoy(lector, fecha_usar, hoja):
             pegar_gestion = False
             pegar_consolidado = False
             omitir_copiado_por_fecha_existente = True
@@ -196,6 +202,7 @@ def main(
                 mes=mes_usar,
                 anio=anio_usar,
                 hoja_arqueos_mf=hoja,
+                fecha_proceso=fecha_usar,
             )
             logger.info("Pegado de gestión a ARQUEOS MF completado (mes=%s, anio=%s).", mes_usar, anio_usar)
         if pegar_consolidado:
@@ -256,6 +263,20 @@ def main(
                 logger.info("Regla observaciones CUADRADO EN ARQUEO aplicada: %d fila(s) en gestión.", n_cuad)
         except Exception as e:
             logger.warning("No se pudo aplicar regla CUADRADO EN ARQUEO en gestión: %s", e)
+
+        # DIARIO con ARQUEO en el mismo archivo: alinear observaciones desde la fila ARQUEO (tras el resto de reglas).
+        try:
+            lector.sincronizar_observaciones_diario_desde_arqueo(fecha=fecha_usar, hoja_gestion=None)
+        except Exception as e:
+            logger.warning("No se pudo sincronizar observaciones DIARIO desde ARQUEO: %s", e)
+
+        # DIARIO solo (sin ARQUEO), sobrante bajo parametrizable, sin calificación previa.
+        try:
+            n_sb = lector.aplicar_regla_diario_sobrante_bajo_sin_arqueo(fecha=fecha_usar, hoja_gestion=None)
+            if n_sb:
+                logger.info("Regla DIARIO sobrante bajo sin ARQUEO: %d fila(s) en gestión.", n_sb)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla DIARIO sobrante bajo sin ARQUEO: %s", e)
         return
 
     try:

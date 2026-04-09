@@ -12,6 +12,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import date, timedelta
 import pandas as pd
 
+from src.insumos.arqueos_mf_calendario import meses_libro_candidatos_fecha_descarga
+
 logger = logging.getLogger(__name__)
 
 CUENTA_CAJERO = 110505075
@@ -268,9 +270,15 @@ def calcular_remanente_para_cajero_cuadrado(
 ) -> Tuple[Optional[float], Dict[str, Any]]:
     """
     1) Ajuste 770500 (signo contrario al de la BD). Construye términos de fórmula.
-    2) Si |diferencia| > umbral_810291 (50M): aplicar 810291 en orden CLVMOV (uno a uno) con signo contrario.
+    2) Tras 770500, evaluar 810291 por naturaleza de la diferencia:
+       - Sobrante (diferencia<0): considerar 810291 positivos
+       - Faltante (diferencia>0): considerar 810291 negativos
+       Se toma el movimiento con menor CLVMOV y solo aplica si su cobertura sobre la diferencia
+       está en el rango [90%, 110%] (signo aplicado contrario al de la BD).
     3) Si faltante restante <= umbral_sobrantes (20M): buscar en cuenta sobrantes; si coincide, agregar.
     4) Si faltante > 20M y no hay más 810291: gestion_manual.
+    5) Si es sobrante y su magnitud supera el tope parametrizable para 279510020, no contabilizar:
+       marcar ACLARAR DIFERENCIA Y REPETIR EL ARQUEO.
     Remanente se escribe como fórmula Excel "=valor1+valor2-valor3..."
     """
     try:
@@ -278,9 +286,13 @@ def calcular_remanente_para_cajero_cuadrado(
         config = CargadorConfig()
         umbrales = config.obtener_umbrales_remanente()
     except Exception:
-        umbrales = {"faltante_minimo_para_810291": 50_000_000, "faltante_limite_sobrantes": 20_000_000, "sobrantes_incluir_dia_arqueo": True}
-    lim_810291 = umbral_faltante_810291 if umbral_faltante_810291 is not None else umbrales.get("faltante_minimo_para_810291", 50_000_000)
+        umbrales = {
+            "faltante_limite_sobrantes": 20_000_000,
+            "sobrante_maximo_contabilizar_279510020": 50_000_000,
+            "sobrantes_incluir_dia_arqueo": True,
+        }
     lim_sobrantes = umbral_faltante_sobrantes if umbral_faltante_sobrantes is not None else umbrales.get("faltante_limite_sobrantes", 20_000_000)
+    lim_sobrante_contabilizar = float(umbrales.get("sobrante_maximo_contabilizar_279510020", 50_000_000))
     incluir_dia_arqueo_sob = umbrales.get("sobrantes_incluir_dia_arqueo", True)
 
     detalle = {
@@ -292,6 +304,7 @@ def calcular_remanente_para_cajero_cuadrado(
         "ratificado_cuadrado": False,
         "justificado_sobrantes": False,
         "gestion_manual": False,
+        "sobrante_excede_tope_repetir": False,
         "aclarar_diferencia": False,  # Faltante <= umbral sobrantes pero no se logró justificar con sobrantes
         "sobrante_contabilizado_gerencia": False,  # Tras 770500+810291 queda sobrante; se graba texto cuenta 279510020
         "formula_remanente": None,
@@ -339,70 +352,69 @@ def calcular_remanente_para_cajero_cuadrado(
         f"diferencia_d0_menos_remanente={_fmt_traza_num(diferencia)}"
     )
 
-    # Aplicar 810291 en alternancia: preferir positivo luego negativo; si no hay del turno, aplicar del otro (así se permiten solo negativos o solo positivos).
+    # 810291 iterativo por signo de diferencia (sin umbral fijo), usando CLVMOV asc.
     aplicados_810291 = []
-    ip, in_ = 0, 0
-    apply_positive_next = True  # preferir empezar por un positivo
-    while abs(diferencia) > lim_810291:  # entrar por magnitud: faltante o sobrante > 50M
-        aplicado = False
-        if apply_positive_next:
-            if ip < len(positivos_810291):
-                m = positivos_810291[ip]
-                ip += 1
-                v_bd = float(m.get("VALOR", 0) or 0)
-                aporte = -v_bd
-                remanente += aporte
-                terminos.append(_term_formula(aporte))
-                aplicados_810291.append(aporte)
-                apply_positive_next = False
-                aplicado = True
-            elif in_ < len(negativos_810291):
-                m = negativos_810291[in_]
-                in_ += 1
-                v_bd = float(m.get("VALOR", 0) or 0)
-                aporte = -v_bd
-                remanente += aporte
-                terminos.append(_term_formula(aporte))
-                aplicados_810291.append(aporte)
-                apply_positive_next = True
-                aplicado = True
+    idx_pos, idx_neg = 0, 0
+    rango_min_base, rango_max_base = 0.80, 1.20
+    hubo_intento_810 = False
+    while abs(float(diferencia)) > tolerancia:
+        diferencia_before_810 = float(diferencia)
+        rango_min, rango_max = rango_min_base, rango_max_base
+        candidato = None
+        signo_objetivo = ""
+        if diferencia_before_810 < -tolerancia:
+            # Sobrante: buscar 810291 positivos (al invertir signo, restan remanente).
+            if idx_pos < len(positivos_810291):
+                candidato = positivos_810291[idx_pos]
+                idx_pos += 1
+            signo_objetivo = "positivo"
+        elif diferencia_before_810 > tolerancia:
+            # Faltante: buscar 810291 negativos (al invertir signo, suman remanente).
+            if idx_neg < len(negativos_810291):
+                candidato = negativos_810291[idx_neg]
+                idx_neg += 1
+            signo_objetivo = "negativo"
         else:
-            if in_ < len(negativos_810291):
-                m = negativos_810291[in_]
-                in_ += 1
-                v_bd = float(m.get("VALOR", 0) or 0)
-                aporte = -v_bd
-                remanente += aporte
-                terminos.append(_term_formula(aporte))
-                aplicados_810291.append(aporte)
-                apply_positive_next = True
-                aplicado = True
-            elif ip < len(positivos_810291):
-                m = positivos_810291[ip]
-                ip += 1
-                v_bd = float(m.get("VALOR", 0) or 0)
-                aporte = -v_bd
-                remanente += aporte
-                terminos.append(_term_formula(aporte))
-                aplicados_810291.append(aporte)
-                apply_positive_next = False
-                aplicado = True
-        if not aplicado:
             break
-        diferencia = d0 - remanente
-        if abs(diferencia) <= lim_sobrantes:
+
+        if candidato is None:
+            if not hubo_intento_810:
+                detalle["traza_pasos"].append(
+                    f"810291 no_aplica_por_signo | diferencia={_fmt_traza_num(diferencia)} | "
+                    f"signo_requerido={signo_objetivo or 'ninguno'}"
+                )
+            else:
+                detalle["traza_pasos"].append(
+                    f"810291 sin_mas_candidatos_signo={signo_objetivo} | diferencia_actual={_fmt_traza_num(diferencia)}"
+                )
             break
+
+        hubo_intento_810 = True
+        v_bd = float(candidato.get("VALOR", 0) or 0)
+        aporte = -v_bd
+        cobertura = (abs(aporte) / abs(diferencia_before_810)) if abs(diferencia_before_810) > 0 else 0.0
+        cobertura_pct = cobertura * 100.0
+        if rango_min <= cobertura <= rango_max:
+            remanente += aporte
+            terminos.append(_term_formula(aporte))
+            aplicados_810291.append(aporte)
+            diferencia = d0 - remanente
+            detalle["traza_pasos"].append(
+                f"810291 aplica_por_signo={signo_objetivo} | clvmov={candidato.get('CLVMOV')} | "
+                f"valor_bd={_fmt_traza_num(v_bd)} | aporte_inv_signo={_fmt_traza_num(aporte)} | "
+                f"cobertura={cobertura_pct:.2f}% (rango {rango_min*100:.0f}%-{rango_max*100:.0f}%) | diferencia_actual={_fmt_traza_num(diferencia)}"
+            )
+            continue
+
+        detalle["traza_pasos"].append(
+            f"810291 no_aplica_por_cobertura | signo_objetivo={signo_objetivo} | clvmov={candidato.get('CLVMOV')} | "
+            f"valor_bd={_fmt_traza_num(v_bd)} | cobertura={cobertura_pct:.2f}% fuera de {rango_min*100:.0f}%-{rango_max*100:.0f}% | "
+            f"diferencia_se_mantiene={_fmt_traza_num(diferencia)}"
+        )
+        # Si el mejor candidato por CLVMOV no cumple cobertura, no seguimos con más del mismo signo.
+        break
+
     detalle["remanente_810291"] = sum(aplicados_810291)
-    if aplicados_810291:
-        detalle["traza_pasos"].append(
-            f"810291 aplicados={len(aplicados_810291)} | umbral_entrada_|diferencia|>{_fmt_traza_num(lim_810291)} | "
-            f"aporte_810291_total={_fmt_traza_num(detalle['remanente_810291'])} | diferencia_actual={_fmt_traza_num(diferencia)}"
-        )
-    else:
-        detalle["traza_pasos"].append(
-            f"810291 no aplica (|diferencia| tras 770500 no supera {_fmt_traza_num(lim_810291)} o sin movimientos) | "
-            f"diferencia={_fmt_traza_num(diferencia)}"
-        )
 
     if abs(diferencia) <= tolerancia:
         detalle["ratificado_cuadrado"] = True
@@ -412,7 +424,23 @@ def calcular_remanente_para_cajero_cuadrado(
         )
         return (remanente, detalle)
 
+    if detalle.get("gestion_manual"):
+        detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+        detalle["traza_pasos"].append(
+            "RESULTADO gestión manual | faltante sin cierre según reglas vigentes"
+        )
+        return (remanente, detalle)
+
     if diferencia <= 0:
+        if abs(float(diferencia)) > lim_sobrante_contabilizar:
+            detalle["sobrante_excede_tope_repetir"] = True
+            detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
+            detalle["traza_pasos"].append(
+                f"RESULTADO sobrante_excede_tope | abs(diferencia)={_fmt_traza_num(abs(float(diferencia)))} > "
+                f"tope_contabilizar_sobrante({_fmt_traza_num(lim_sobrante_contabilizar)}) | "
+                "marcar ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
+            )
+            return (remanente, detalle)
         detalle["sobrante_contabilizado_gerencia"] = True
         detalle["formula_remanente"] = "=" + "".join(terminos).lstrip("+") if terminos else "=0"
         detalle["traza_pasos"].append(
@@ -647,13 +675,50 @@ def procesar_cuadrados_fecha_descarga(
 ) -> int:
     """
     Procesa todos los cajeros con Fecha descarga arqueo = fecha_descarga (cuadrados y descuadrados).
-    Para cada uno: revisa movimientos 770500 el día del arqueo y ajusta Remanente (signo contrario al de la BD).
-    Si queda faltante, busca en cuenta sobrantes (279510020) negativos vigentes que lo justifiquen (cruce).
-    Si queda cuadrado, ratifica y puede escribir "Cajero cuadrado...". Actualiza Excel, fórmulas y Gestión a Realizar.
-    La columna paso_a_paso_regla en ARQUEOS MF solo se escribe si remanente.columna_paso_a_paso_arqueos_mf es true en config.
+    Recorre los libros mensuales candidatos (mes de la descarga y mes anterior): cada fila vive en el
+    ARQUEOS MF del **mes de su Fecha Arqueo**. Parámetros mes/anio del proceso se ignoran (compatibilidad).
 
     Returns:
-        Número de registros actualizados (con Remanente y/o Gestión).
+        Número total de registros actualizados (con Remanente y/o Gestión).
+    """
+    total = 0
+    for mes_libro, anio_libro in meses_libro_candidatos_fecha_descarga(fecha_descarga):
+        try:
+            lector.asegurar_archivo_arqueos_mf(mes_libro, anio_libro)
+        except FileNotFoundError:
+            logger.warning(
+                "No se pudo crear u obtener ARQUEOS MF para libro mes=%s anio=%s (sin plantilla en el directorio).",
+                mes_libro,
+                anio_libro,
+            )
+            continue
+        df_lookup = _concat_df_lookup_remanente(lector, mes_libro, anio_libro, hoja)
+        total += _procesar_cuadrados_fecha_descarga_un_libro(
+            lector,
+            admin_bd,
+            mes_libro,
+            anio_libro,
+            hoja,
+            fecha_descarga,
+            tolerancia,
+            df_lookup,
+        )
+    return total
+
+
+def _procesar_cuadrados_fecha_descarga_un_libro(
+    lector,
+    admin_bd,
+    mes: int,
+    anio: int,
+    hoja,
+    fecha_descarga: date,
+    tolerancia: float,
+    df_lookup: pd.DataFrame,
+) -> int:
+    """
+    Procesa solo el archivo ARQUEOS MF del mes `mes`/`anio`, usando `df_lookup` (este libro + anterior)
+    para penúltimo arqueo y comparación de gestión previa.
     """
     df = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
     col_cajero = _buscar_columna(df, ["Cajero", "cajero"])
@@ -670,10 +735,14 @@ def procesar_cuadrados_fecha_descarga(
     if col_remanente is None:
         df["Remanente /Provisión /Ajustes"] = 0.0
         col_remanente = "Remanente /Provisión /Ajustes"
+    # Excel/pandas suelen cargar Remanente como float; las fórmulas (=t1+t2...) son texto.
+    df[col_remanente] = df[col_remanente].astype(object)
     col_gestion = _buscar_columna(df, ["Gestión a Realizar", "Gestion a Realizar"])
     if col_gestion is None:
         col_gestion = "Gestión a Realizar"
         df[col_gestion] = ""
+    # Hoja ARQUEOS MF a veces carga esta columna como float (celdas vacías); los textos de gestión son string.
+    df[col_gestion] = df[col_gestion].astype(object)
 
     from src.procesamiento.pegar_gestion_a_arqueos_mf import TEXTO_CAJERO_CUADRADO
     # Fecha de gestión (día de hoy o de gestión) para el texto de cruce faltante-sobrante
@@ -720,7 +789,7 @@ def procesar_cuadrados_fecha_descarga(
         anio_a, mes_a, dia_a = fa.year, fa.month, fa.day
         # El rango de sobrantes va desde el penúltimo arqueo del cajero hasta el último arqueo (incluyendo el día del arqueo actual).
         fecha_desde_sob = obtener_fecha_penultimo_arqueo(
-            cajero, fa, df, col_cajero, col_fecha_arqueo, lector
+            cajero, fa, df_lookup, col_cajero, col_fecha_arqueo, lector
         )
         remanente_final, detalle = calcular_remanente_para_cajero_cuadrado(
             admin_bd, cajero, anio_a, mes_a, dia_a,
@@ -752,6 +821,12 @@ def procesar_cuadrados_fecha_descarga(
         gestion_no_vacia = valor_gestion_actual is not None and not (isinstance(valor_gestion_actual, float) and pd.isna(valor_gestion_actual)) and str(valor_gestion_actual).strip() != ""
         if gestion_no_vacia:
             logger.info("Cajero %s (F. arqueo %s): Gestión a Realizar ya tiene valor; no se sobrescribe. Remanente actualizado.", cajero, fa)
+        elif detalle.get("sobrante_excede_tope_repetir"):
+            df.at[idx, col_gestion] = TEXTO_ACLARAR_REPETIR_ARQUEO
+            logger.info(
+                "Cajero %s (F. arqueo %s): sobrante excede tope para 279510020; %s.",
+                cajero, fa, TEXTO_ACLARAR_REPETIR_ARQUEO,
+            )
         elif detalle.get("gestion_manual"):
             # Faltante residual muy bajo: grabar en cuenta faltantes (no repetir arqueo por montos triviales).
             if faltante_pequeno_grabar:
@@ -802,7 +877,7 @@ def procesar_cuadrados_fecha_descarga(
                 # Evitar repetir arqueo 2 veces seguidas: revisar si el arqueo anterior del mismo cajero tuvo la misma calificación.
                 gestion_prev = ""
                 fa_prev = None
-                for _, rprev in df.iterrows():
+                for _, rprev in df_lookup.iterrows():
                     if pd.isna(rprev.get(col_cajero)):
                         continue
                     try:
@@ -858,7 +933,7 @@ def procesar_cuadrados_fecha_descarga(
                 else:
                     gestion_prev_a = ""
                     fa_prev_a = None
-                    for _, rprev in df.iterrows():
+                    for _, rprev in df_lookup.iterrows():
                         if pd.isna(rprev.get(col_cajero)):
                             continue
                         try:
@@ -942,6 +1017,30 @@ def _buscar_columna(df: pd.DataFrame, nombres: list) -> Optional[str]:
         if (str(c).strip().lower() in [str(n).strip().lower() for n in nombres]):
             return c
     return None
+
+
+def _concat_df_lookup_remanente(lector, mes_libro: int, anio_libro: int, hoja) -> pd.DataFrame:
+    """
+    Libro del mes del arqueo + mes calendario anterior (mismo archivo o el previo) para resolver
+    penúltimo arqueo y gestión previa al cruzar fin de mes.
+    """
+    pares = [
+        (mes_libro, anio_libro),
+        (12, anio_libro - 1) if mes_libro == 1 else (mes_libro - 1, anio_libro),
+    ]
+    dfs = []
+    for mm, aa in pares:
+        ruta = lector._ruta_arqueos_mf(mm, aa)
+        if ruta.exists():
+            dfs.append(lector.leer_arqueos_mf(mm, aa, hoja=hoja, crear_si_falta=False))
+    if not dfs:
+        return pd.DataFrame()
+    out = pd.concat(dfs, ignore_index=True)
+    col_caj = _buscar_columna(out, ["Cajero", "cajero"])
+    col_fa = _buscar_columna(out, ["Fecha Arqueo", "Fecha arqueo"])
+    if col_caj and col_fa:
+        out = out.drop_duplicates(subset=[col_caj, col_fa], keep="last")
+    return out
 
 
 def _valor_a_fecha(val) -> Optional[date]:

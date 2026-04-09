@@ -4,9 +4,15 @@ coincida con el saldo en NACIONAL del día anterior al día del arqueo.
 Consulta: GCOLIBRANL.GCOFFSD{MM} con columna SALD{d} (saldo del día d del mes MM).
 """
 from datetime import datetime, timedelta, date
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
+from collections import defaultdict
 import pandas as pd
 import logging
+
+from src.insumos.arqueos_mf_calendario import (
+    meses_libro_candidatos_fecha_descarga,
+    periodo_libro_desde_fecha_arqueo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,10 +246,40 @@ def marcar_discrepancias_gestion_a_realizar(
     """
     Escribe en la columna "Gestión a Realizar" del ARQUEOS MF el mensaje indicado
     en las filas que corresponden a las discrepancias (mismo Cajero y Fecha Arqueo).
+    Usa el libro mensual del mes de **fecha_arqueo** de cada discrepancia; mes/anio solo resuelven fallback.
     """
     if not discrepancias:
         return
-    df = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
+    por_libro: Dict[Tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for r in discrepancias:
+        fd = _fecha_discrepancia_a_date(r.get("fecha_arqueo"))
+        if fd is not None:
+            mm, aa = periodo_libro_desde_fecha_arqueo(fd)
+        else:
+            mm, aa = mes, anio
+        por_libro[(mm, aa)].append(r)
+
+    for (mm, aa), lista in por_libro.items():
+        try:
+            df = lector.leer_arqueos_mf(mes=mm, anio=aa, hoja=hoja, crear_si_falta=False)
+        except FileNotFoundError:
+            logger.warning("No se encontró ARQUEOS MF para marcar discrepancias (mes=%s, anio=%s).", mm, aa)
+            continue
+        _marcar_discrepancias_en_df_arqueos_mf(df, lista, mensaje, lector, mm, aa, hoja)
+
+
+def _marcar_discrepancias_en_df_arqueos_mf(
+    df: pd.DataFrame,
+    discrepancias: List[Dict[str, Any]],
+    mensaje: str,
+    lector,
+    mes: int,
+    anio: int,
+    hoja: Union[str, int],
+) -> None:
+    """Marca filas en un único DataFrame ARQUEOS MF y guarda."""
+    if not discrepancias:
+        return
     col_cajero = _buscar_columna(df, ["Cajero", "cajero"])
     col_fecha = _buscar_columna(df, ["Fecha Arqueo", "Fecha arqueo", "fecha_arqueo"])
     nombres_gestion = [
@@ -311,7 +347,22 @@ def ejecutar_verificacion(
         logger.warning("BD no configurada o usar_bd=false; no se puede verificar saldos en NACIONAL.")
         return []
 
-    df = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja)
+    if fecha_descarga_filtro is not None:
+        frames = []
+        for mm, aa in meses_libro_candidatos_fecha_descarga(fecha_descarga_filtro):
+            ruta = lector._ruta_arqueos_mf(mm, aa)
+            if ruta.exists():
+                frames.append(lector.leer_arqueos_mf(mm, aa, hoja=hoja, crear_si_falta=False))
+        if not frames:
+            logger.warning("No hay archivos ARQUEOS MF para verificar saldos (libros candidatos vacíos).")
+            return []
+        df = pd.concat(frames, ignore_index=True)
+        col_caj = _buscar_columna(df, ["Cajero", "cajero"])
+        col_fa = _buscar_columna(df, ["Fecha Arqueo", "Fecha arqueo"])
+        if col_caj and col_fa:
+            df = df.drop_duplicates(subset=[col_caj, col_fa], keep="last")
+    else:
+        df = lector.leer_arqueos_mf(mes=mes, anio=anio, hoja=hoja, crear_si_falta=False)
     try:
         admin.conectar()
         discrepancias = verificar_saldos_contables(
