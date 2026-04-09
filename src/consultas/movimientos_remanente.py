@@ -253,6 +253,17 @@ def _fecha_sobrante_str(m: Dict[str, Any]) -> str:
         return ""
 
 
+def _numdoc_de_mov(m: Dict[str, Any]) -> Optional[int]:
+    """NUMDOC del movimiento en cuenta sobrantes (típicamente YYYYMMDD como entero)."""
+    try:
+        v = m.get("NUMDOC")
+        if v is None:
+            return None
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
 def calcular_remanente_para_cajero_cuadrado(
     admin_bd,
     nit: int,
@@ -520,7 +531,13 @@ def calcular_remanente_para_cajero_cuadrado(
                         break
                     use_amount = min(amount, need)
                     running_sum += use_amount
-                    utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": use_amount})
+                    utilizados.append(
+                        {
+                            "fecha_str": _fecha_sobrante_str(m),
+                            "valor": use_amount,
+                            "numdoc": _numdoc_de_mov(m),
+                        }
+                    )
                     if abs(running_sum - objetivo) <= tolerancia:
                         return running_sum, utilizados
                 return running_sum, utilizados
@@ -556,7 +573,13 @@ def calcular_remanente_para_cajero_cuadrado(
                 if amount <= 0:
                     continue
                 sum_after_utilizada += amount
-                after_utilizados.append({"fecha_str": _fecha_sobrante_str(m), "valor": amount})
+                after_utilizados.append(
+                    {
+                        "fecha_str": _fecha_sobrante_str(m),
+                        "valor": amount,
+                        "numdoc": _numdoc_de_mov(m),
+                    }
+                )
 
             remaining = faltante - sum_after_utilizada
             if remaining < -tolerancia:
@@ -681,6 +704,7 @@ def procesar_cuadrados_fecha_descarga(
     Returns:
         Número total de registros actualizados (con Remanente y/o Gestión).
     """
+    lector._pendientes_cruce_gestion.clear()
     total = 0
     for mes_libro, anio_libro in meses_libro_candidatos_fecha_descarga(fecha_descarga):
         try:
@@ -866,6 +890,18 @@ def _procesar_cuadrados_fecha_descarga_un_libro(
             df.at[idx, col_gestion] = texto_gestion
             logger.info("Cajero %s (F. arqueo %s): faltante justificado con sobrantes, remanente %.2f (banco %.2f + sobrantes %.2f). Gestión: %s",
                         cajero, fa, remanente_final, detalle.get("remanente_banco", 0), detalle.get("remanente_sobrantes", 0), texto_gestion[:60])
+            su = detalle.get("sobrantes_utilizados") or []
+            if su:
+                vf = float(detalle.get("valor_faltante", 0) or 0)
+                cruces = [
+                    {
+                        "valor": float(u.get("valor", 0) or 0),
+                        "valor_faltante": vf,
+                        "numdoc": u.get("numdoc"),
+                    }
+                    for u in su
+                ]
+                lector.registrar_pendiente_cruce_gestion(cajero, cruces)
         elif detalle.get("aclarar_diferencia"):
             if faltante_pequeno_grabar:
                 df.at[idx, col_gestion] = texto_gestion_faltante_pequeno_centralizado(fecha_gestion_str)

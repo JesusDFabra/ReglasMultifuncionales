@@ -4,7 +4,7 @@ y archivo mensual de arqueos MF (lectura y edición).
 """
 from pathlib import Path
 from glob import glob
-from typing import List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime, date
 import shutil
 import re
@@ -29,6 +29,18 @@ OBSERVACIONES_CUADRADO_EN_ARQUEO = "CUADRADO EN ARQUEO"
 NUEVO_ESTADO_SOBRANTE_DIARIO_CONTABLES = "CONTABILIZACION SOBRANTE CONTABLES"
 OBSERVACIONES_SOBRANTE_CUADRE_DIARIO = "SE GRABA SOBRANTE DE CUADRE DIARIO."
 
+# Cruce faltante ↔ sobrante 279510020 (gestión): un registro ARQUEO por cada NUMDOC usado.
+RATIFICAR_CRUCE_FALTANTE_ARQUEO = "Reverso"
+JUSTIFICACION_CRUCE_FALTANTE_ARQUEO = "Cruzar"
+NUEVO_ESTADO_CRUCE_FALTANTE_ARQUEO = "CRUCE DE NOVEDADES"
+OBSERVACIONES_DIARIO_CRUCE_FALTANTE = "SE CRUZA DIFERENCIA DE ARQUEO"
+# DIARIO con faltante y sin calificación previa: espera de arqueo para cerrar la diferencia.
+OBSERVACIONES_DIARIO_ESPERA_ARQUEO = "EN ESPERA DE ARQUEO"
+
+# Contabilización centralizada cuenta faltantes 168710093 (ARQUEOS MF) → gestión.
+NUEVO_ESTADO_CONTAB_FALTANTE_ARQUEO = "FALTANTE EN ARQUEO"
+OBSERVACIONES_GRABA_FALTANTE_ARQUEO = "SE GRABA FALTANTE DE ARQUEO"
+
 
 class LectorInsumos:
     """Carga los archivos Excel de insumo según la configuración."""
@@ -37,6 +49,14 @@ class LectorInsumos:
         self.config = config or CargadorConfig()
         # Tras preparar_copia_gestion_procesada(), las reglas leen/escriben solo esta ruta (copia *_procesado).
         self._ruta_gestion_escritura: Optional[Path] = None
+        # Acumulado en procesar_cuadrados (justificado_sobrantes); se aplica al final del flujo main.
+        self._pendientes_cruce_gestion: Dict[int, List[Dict[str, Any]]] = {}
+
+    def registrar_pendiente_cruce_gestion(self, cajero: int, cruces: List[Dict[str, Any]]) -> None:
+        """Registra cruces faltante-sobrante (valor + numdoc) para escribir luego en gestión."""
+        if not cruces:
+            return
+        self._pendientes_cruce_gestion[int(cajero)] = list(cruces)
 
     @staticmethod
     def _col_cajero_en_df(df: pd.DataFrame) -> Optional[str]:
@@ -672,6 +692,281 @@ class LectorInsumos:
         )
         return int(mask_aplicar.sum())
 
+    def aplicar_regla_diario_faltante_espera_arqueo(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+    ) -> int:
+        """
+        Registros DIARIO (y DIADIO) con faltante en columna ``faltantes`` y sin ninguna calificación
+        previa en ratificar/justificación/nuevo_estado/observaciones: marcar espera de arqueo.
+
+        Criterio "sin regla": mismos cuatro campos vacíos que en otras reglas DIARIO
+        (``_diario_gestion_fila_tiene_calificacion`` es False).
+        """
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning(
+                "No se encontró gestión para %s; no se aplica regla DIARIO faltante espera arqueo.",
+                fecha_usar,
+            )
+            return 0
+
+        if hoja_gestion:
+            df = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df = pd.read_excel(ruta, engine="openpyxl")
+
+        if "tipo_registro" not in df.columns or "faltantes" not in df.columns:
+            return 0
+
+        tipo_norm = df["tipo_registro"].astype(str).str.strip().str.upper()
+        mask_diario = tipo_norm.isin(["DIARIO", "DIADIO"])
+        faltantes_num = pd.to_numeric(df["faltantes"], errors="coerce").fillna(0.0)
+        mask_faltante = faltantes_num > 0.5
+
+        mask_candidatas = mask_diario & mask_faltante
+        idxs_aplicar = [
+            idx for idx in df.index[mask_candidatas] if not self._diario_gestion_fila_tiene_calificacion(df, idx)
+        ]
+        if not idxs_aplicar:
+            return 0
+
+        mask_aplicar = pd.Series(False, index=df.index)
+        mask_aplicar.loc[idxs_aplicar] = True
+
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones", "grabar"):
+            if col in df.columns:
+                df[col] = df[col].astype("object")
+
+        df.loc[mask_aplicar, "ratificar_grabar_diferencia"] = "No"
+        df.loc[mask_aplicar, "justificacion"] = "Contable"
+        df.loc[mask_aplicar, "nuevo_estado"] = "ERROR EN TRANSMISION DE CONTADORES"
+        df.loc[mask_aplicar, "observaciones"] = OBSERVACIONES_DIARIO_ESPERA_ARQUEO
+        if "grabar" in df.columns:
+            df.loc[mask_aplicar, "grabar"] = "No"
+
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask_aplicar,
+            df,
+            hoja=hoja_gestion,
+        )
+        logger.info(
+            "Regla DIARIO faltante espera arqueo (excl. ya calificados): %d fila(s).",
+            int(mask_aplicar.sum()),
+        )
+        return int(mask_aplicar.sum())
+
+    def aplicar_regla_cruce_faltante_sobrante_gestion_pendientes(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+    ) -> int:
+        """
+        Cruces faltante-sobrante (NUMDOC) detectados en procesar_cuadrados. Un registro ARQUEO por
+        cada cruce; DIARIO con texto fijo (si no calificado). En main va antes de
+        ``aplicar_regla_diario_solo_sobrante_espera_arqueo_ultima``.
+        """
+        if not self._pendientes_cruce_gestion:
+            return 0
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning("No se encontró gestión para %s; no se aplica cruce faltante.", fecha_usar)
+            self._pendientes_cruce_gestion.clear()
+            return 0
+
+        if hoja_gestion:
+            df = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df = pd.read_excel(ruta, engine="openpyxl")
+
+        n_cajeros = 0
+        for cajero, cruces in list(self._pendientes_cruce_gestion.items()):
+            df = self._aplicar_cruce_faltante_un_cajero_en_df(df, cajero, cruces)
+            n_cajeros += 1
+
+        self._pendientes_cruce_gestion.clear()
+
+        try:
+            from openpyxl import load_workbook as _lw
+
+            wb = _lw(ruta, read_only=True)
+            nombre_hoja = hoja_gestion if hoja_gestion and hoja_gestion in wb.sheetnames else wb.sheetnames[0]
+            wb.close()
+            with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name=nombre_hoja)
+        except Exception as e:
+            logger.warning("No se pudo guardar gestión tras cruce faltante-sobrante: %s", e)
+            return 0
+
+        logger.info("Regla cruce faltante-sobrante en gestión aplicada a %d cajero(s).", n_cajeros)
+        return n_cajeros
+
+    def aplicar_regla_diario_solo_sobrante_espera_arqueo_ultima(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+    ) -> int:
+        """
+        Última regla del flujo: filas **solo DIARIO/DIADIO** (ninguna fila ARQUEO del mismo cajero
+        en el archivo de gestión) con **sobrantes** distintos de cero, que **aún** no tienen
+        calificación en ratificar/justificación/nuevo_estado/observaciones.
+
+        Calificación:
+        No / Contable / ERROR EN TRANSMISION DE CONTADORES / EN ESPERA DE ARQUEO
+        """
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning(
+                "No se encontró gestión para %s; no se aplica regla última DIARIO solo sobrante.",
+                fecha_usar,
+            )
+            return 0
+
+        if hoja_gestion:
+            df = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df = pd.read_excel(ruta, engine="openpyxl")
+
+        if "tipo_registro" not in df.columns or "sobrantes" not in df.columns:
+            return 0
+
+        col_cajero = self._col_cajero_en_df(df)
+        if not col_cajero:
+            return 0
+
+        tipo_norm = df["tipo_registro"].astype(str).str.strip().str.upper()
+        mask_diario = tipo_norm.isin(["DIARIO", "DIADIO"])
+
+        cajeros_con_arqueo: Set[int] = set()
+        for idx in df.index[tipo_norm == "ARQUEO"]:
+            try:
+                cajeros_con_arqueo.add(int(float(df.at[idx, col_cajero])))
+            except (TypeError, ValueError):
+                continue
+
+        caj_num = pd.to_numeric(df[col_cajero], errors="coerce")
+        mask_solo_diario = mask_diario & ~caj_num.isin(list(cajeros_con_arqueo))
+
+        sobrantes_num = pd.to_numeric(df["sobrantes"], errors="coerce").fillna(0.0)
+        mask_tiene_sobrante = sobrantes_num.abs() > 0.5
+
+        mask_candidatas = mask_solo_diario & mask_tiene_sobrante
+        idxs_aplicar = [
+            idx for idx in df.index[mask_candidatas] if not self._diario_gestion_fila_tiene_calificacion(df, idx)
+        ]
+        if not idxs_aplicar:
+            return 0
+
+        mask_aplicar = pd.Series(False, index=df.index)
+        mask_aplicar.loc[idxs_aplicar] = True
+
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones", "grabar"):
+            if col in df.columns:
+                df[col] = df[col].astype("object")
+
+        df.loc[mask_aplicar, "ratificar_grabar_diferencia"] = "No"
+        df.loc[mask_aplicar, "justificacion"] = "Contable"
+        df.loc[mask_aplicar, "nuevo_estado"] = "ERROR EN TRANSMISION DE CONTADORES"
+        df.loc[mask_aplicar, "observaciones"] = OBSERVACIONES_DIARIO_ESPERA_ARQUEO
+        if "grabar" in df.columns:
+            df.loc[mask_aplicar, "grabar"] = "No"
+
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask_aplicar,
+            df,
+            hoja=hoja_gestion,
+        )
+        logger.info(
+            "Regla última DIARIO solo con sobrante (sin ARQUEO en gestión, excl. ya calificados): %d fila(s).",
+            int(mask_aplicar.sum()),
+        )
+        return int(mask_aplicar.sum())
+
+    def _aplicar_cruce_faltante_un_cajero_en_df(
+        self,
+        df: pd.DataFrame,
+        cajero: int,
+        cruces: List[Dict[str, Any]],
+    ) -> pd.DataFrame:
+        """
+        Solo se duplican/reemplazan filas ARQUEO (un registro por NUMDOC).
+        DIARIO: una sola fila por cajero (sin duplicar); siempre se sobrescribe con la calificación fija de esta regla.
+        """
+        if not cruces:
+            return df
+        df = df.copy().reset_index(drop=True)
+        col_caj = self._col_cajero_en_df(df)
+        if not col_caj or "tipo_registro" not in df.columns:
+            return df
+
+        tipo = df["tipo_registro"].astype(str).str.strip().str.upper()
+        caj_num = pd.to_numeric(df[col_caj], errors="coerce")
+        mask_caj = caj_num == cajero
+        idx_diario = df.index[mask_caj & tipo.isin(["DIARIO", "DIADIO"])].tolist()
+        idx_arqueo = df.index[mask_caj & (tipo == "ARQUEO")].tolist()
+        if not idx_arqueo:
+            logger.warning("Cruce gestión: cajero %s sin fila ARQUEO en gestión.", cajero)
+            return df
+
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones", "grabar"):
+            if col in df.columns:
+                df[col] = df[col].astype("object")
+
+        for idi in idx_diario:
+            df.at[idi, "ratificar_grabar_diferencia"] = "No"
+            df.at[idi, "justificacion"] = "Contable"
+            df.at[idi, "nuevo_estado"] = "ERROR EN TRANSMISION DE CONTADORES"
+            df.at[idi, "observaciones"] = OBSERVACIONES_DIARIO_CRUCE_FALTANTE
+            if "grabar" in df.columns:
+                df.at[idi, "grabar"] = "No"
+
+        positions = sorted(int(df.index.get_loc(i)) for i in idx_arqueo)
+        p0 = positions[0]
+        n_drop = len(positions)
+        if positions != list(range(p0, p0 + n_drop)):
+            logger.warning(
+                "Cruce gestión: cajero %s tiene filas ARQUEO no consecutivas; se reemplaza solo la primera.",
+                cajero,
+            )
+            n_drop = 1
+
+        base = df.loc[idx_arqueo[0]].copy()
+        n_cruces = len(cruces)
+        filas = []
+        for cr in cruces:
+            r = base.copy()
+            # Columna faltantes = monto del faltante que se cruza (alineado con ARQUEOS MF).
+            # Un solo NUMDOC: el total declarado en MF (valor_faltante). Varios: tramo por movimiento (valor).
+            vf = cr.get("valor_faltante")
+            if n_cruces == 1 and vf is not None and not (isinstance(vf, float) and pd.isna(vf)):
+                try:
+                    r["faltantes"] = abs(float(vf))
+                except (TypeError, ValueError):
+                    r["faltantes"] = float(cr.get("valor", 0) or 0)
+            else:
+                r["faltantes"] = float(cr.get("valor", 0) or 0)
+            r["sobrantes"] = 0
+            r["ratificar_grabar_diferencia"] = RATIFICAR_CRUCE_FALTANTE_ARQUEO
+            r["justificacion"] = JUSTIFICACION_CRUCE_FALTANTE_ARQUEO
+            r["nuevo_estado"] = NUEVO_ESTADO_CRUCE_FALTANTE_ARQUEO
+            nd = cr.get("numdoc")
+            r["observaciones"] = str(int(nd)) if nd is not None else ""
+            filas.append(r)
+
+        part1 = df.iloc[:p0]
+        part2 = df.iloc[p0 + n_drop :]
+        nuevas_df = pd.DataFrame(filas)
+        return pd.concat([part1, nuevas_df, part2], ignore_index=True)
+
     def _parsear_fecha_dd_mm_yyyy(self, fecha: str) -> date:
         """Convierte DD_MM_YYYY a date."""
         partes = str(fecha).strip().replace("-", "_").split("_")
@@ -968,6 +1263,177 @@ class LectorInsumos:
         )
         logger.info(
             "Regla grabar sobrante desde ARQUEOS MF persistida: %d fila(s) [ARQUEO=%d, DIARIO=%d].",
+            int(mask_final.sum()),
+            int(mask_final_arqueo.sum()),
+            int(mask_final_diario.sum()),
+        )
+        return int(mask_final.sum())
+
+    def aplicar_regla_grabar_faltante_desde_arqueos_mf(
+        self,
+        fecha: Optional[str] = None,
+        hoja_gestion: Optional[str] = None,
+        hoja_arqueos_mf: Union[str, int] = 0,
+    ) -> int:
+        """
+        Sincroniza gestión cuando ARQUEOS MF indica contabilización centralizada en cuenta **168710093**
+        (misma familia de texto que ``texto_gestion_faltante_pequeno_centralizado`` en procesar_cuadrados).
+
+        - ARQUEO: Si / Fisico / FALTANTE EN ARQUEO / SE GRABA FALTANTE DE ARQUEO
+        - DIARIO (y DIADIO): No / Contable / ERROR EN TRANSMISION DE CONTADORES / SE GRABA FALTANTE DE ARQUEO
+
+        Filtra por fecha descarga arqueo = fecha de proceso. Sobrescribe los cuatro campos objetivo.
+        Si hay Diferencia (o traza parseable), alinea sobrantes/faltantes como en la regla de sobrante 279510020.
+        """
+        import pandas as pd
+
+        fecha_usar = fecha or self.config.obtener_fecha_proceso()
+        fecha_descarga = self._parsear_fecha_dd_mm_yyyy(fecha_usar)
+
+        try:
+            ruta = self._ruta_gestion_para_escritura(fecha_usar)
+        except FileNotFoundError:
+            logger.warning(
+                "No se encontró archivo de gestión para %s; no se aplicará regla grabar faltante 168710093.",
+                fecha_usar,
+            )
+            return 0
+
+        if hoja_gestion:
+            df_gestion = pd.read_excel(ruta, sheet_name=hoja_gestion, engine="openpyxl")
+        else:
+            df_gestion = pd.read_excel(ruta, engine="openpyxl")
+        if "tipo_registro" not in df_gestion.columns:
+            return 0
+
+        df_arq = self._df_arqueos_mf_union_meses_descarga(fecha_usar, hoja_arqueos_mf=hoja_arqueos_mf)
+        col_cajero_arq = self._buscar_columna_arqueos(df_arq, ("Cajero", "cajero"))
+        col_gestion_arq = self._buscar_columna_arqueos(df_arq, ("Gestión a Realizar", "Gestion a Realizar"))
+        col_fecha_descarga_arq = self._buscar_columna_arqueos(df_arq, ("Fecha descarga arqueo", "Fecha Descarga Arqueo"))
+        col_diferencia_arq = self._buscar_columna_arqueos(df_arq, ("Diferencia", "diferencia"))
+        col_traza_arq = self._buscar_columna_arqueos(df_arq, ("paso_a_paso_regla", "paso_a_paso_regla"))
+        if not (col_cajero_arq and col_gestion_arq and col_fecha_descarga_arq):
+            logger.warning("ARQUEOS MF no tiene columnas necesarias para regla grabar faltante 168710093.")
+            return 0
+
+        if df_arq.empty:
+            return 0
+
+        fechas_desc = pd.to_datetime(df_arq[col_fecha_descarga_arq], errors="coerce").dt.date
+        mask_fecha = fechas_desc == fecha_descarga
+
+        def _parsear_diferencia_desde_traza(txt: object) -> Optional[float]:
+            t = str(txt or "")
+            m_dif = re.search(r"diferencia_actual=\$(-?[0-9\.]+)", t)
+            if not m_dif:
+                return None
+            try:
+                return float(m_dif.group(1).replace(".", ""))
+            except (TypeError, ValueError):
+                return None
+
+        def _parsear_faltante_residual_desde_traza(txt: object) -> Optional[float]:
+            t = str(txt or "")
+            m = re.search(r"faltante_residual_d0_menos_remanente_calc=\$([0-9\.]+)", t, re.I)
+            if not m:
+                return None
+            try:
+                return float(m.group(1).replace(".", ""))
+            except (TypeError, ValueError):
+                return None
+
+        txt_gestion = df_arq[col_gestion_arq].astype(str).str.strip().str.lower()
+        mask_graba_faltante = txt_gestion.str.contains("cuenta de faltantes 168710093", na=False)
+        mask_candidatos = mask_fecha & mask_graba_faltante
+        if not bool(mask_candidatos.any()):
+            return 0
+
+        dif_por_cajero: Dict[int, float] = {}
+        cajeros_objetivo: Set[int] = set()
+        cols_arq = [col_cajero_arq]
+        if col_diferencia_arq:
+            cols_arq.append(col_diferencia_arq)
+        if col_traza_arq:
+            cols_arq.append(col_traza_arq)
+        for _, r in df_arq.loc[mask_candidatos, cols_arq].iterrows():
+            try:
+                caj = int(float(r[col_cajero_arq]))
+            except (TypeError, ValueError):
+                continue
+            cajeros_objetivo.add(caj)
+            dif = None
+            if col_diferencia_arq and pd.notna(r.get(col_diferencia_arq)):
+                try:
+                    dif = float(r.get(col_diferencia_arq))
+                except (TypeError, ValueError):
+                    dif = None
+            if dif is None and col_traza_arq:
+                dif = _parsear_faltante_residual_desde_traza(r.get(col_traza_arq))
+            if dif is None and col_traza_arq:
+                dif = _parsear_diferencia_desde_traza(r.get(col_traza_arq))
+            if dif is not None:
+                dif_por_cajero[caj] = float(dif)
+
+        if not cajeros_objetivo:
+            return 0
+
+        col_cajero_gestion = None
+        for c in df_gestion.columns:
+            if str(c).strip().lower() in ("cajero", "codigo_cajero", "nit"):
+                col_cajero_gestion = c
+                break
+        if not col_cajero_gestion:
+            return 0
+
+        tipo_norm = df_gestion["tipo_registro"].astype(str).str.strip().str.upper()
+        caj_num = pd.to_numeric(df_gestion[col_cajero_gestion], errors="coerce")
+        mask_cajero = caj_num.isin(list(cajeros_objetivo))
+        mask_arqueo = mask_cajero & (tipo_norm == "ARQUEO")
+        mask_diario = mask_cajero & (tipo_norm.isin(["DIARIO", "DIADIO"]))
+        mask_final_arqueo = mask_arqueo
+        mask_final_diario = mask_diario
+        mask_final = mask_final_arqueo | mask_final_diario
+        if not bool(mask_final.any()):
+            return 0
+
+        for col in ("ratificar_grabar_diferencia", "justificacion", "nuevo_estado", "observaciones"):
+            if col in df_gestion.columns:
+                df_gestion[col] = df_gestion[col].astype("object")
+
+        if "ratificar_grabar_diferencia" in df_gestion.columns:
+            df_gestion.loc[mask_final_arqueo, "ratificar_grabar_diferencia"] = "Si"
+            df_gestion.loc[mask_final_diario, "ratificar_grabar_diferencia"] = "No"
+        if "justificacion" in df_gestion.columns:
+            df_gestion.loc[mask_final_arqueo, "justificacion"] = "Fisico"
+            df_gestion.loc[mask_final_diario, "justificacion"] = "Contable"
+        if "nuevo_estado" in df_gestion.columns:
+            df_gestion.loc[mask_final_arqueo, "nuevo_estado"] = NUEVO_ESTADO_CONTAB_FALTANTE_ARQUEO
+            df_gestion.loc[mask_final_diario, "nuevo_estado"] = "ERROR EN TRANSMISION DE CONTADORES"
+        if "observaciones" in df_gestion.columns:
+            df_gestion.loc[mask_final, "observaciones"] = OBSERVACIONES_GRABA_FALTANTE_ARQUEO
+
+        if ("sobrantes" in df_gestion.columns or "faltantes" in df_gestion.columns) and dif_por_cajero:
+            for idx in df_gestion[mask_final].index:
+                try:
+                    caj = int(float(df_gestion.at[idx, col_cajero_gestion]))
+                except (TypeError, ValueError):
+                    continue
+                if caj not in dif_por_cajero:
+                    continue
+                dif = float(dif_por_cajero[caj])
+                if "sobrantes" in df_gestion.columns:
+                    df_gestion.at[idx, "sobrantes"] = dif if dif <= 0 else 0
+                if "faltantes" in df_gestion.columns:
+                    df_gestion.at[idx, "faltantes"] = dif if dif > 0 else 0
+
+        self._persistir_regla_diario_sobrantes_en_excel(
+            ruta,
+            mask_final,
+            df_gestion,
+            hoja=hoja_gestion,
+        )
+        logger.info(
+            "Regla grabar faltante 168710093 desde ARQUEOS MF persistida: %d fila(s) [ARQUEO=%d, DIARIO=%d].",
             int(mask_final.sum()),
             int(mask_final_arqueo.sum()),
             int(mask_final_diario.sum()),

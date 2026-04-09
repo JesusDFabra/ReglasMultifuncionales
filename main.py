@@ -147,6 +147,12 @@ def main(
                 logger.info("Procesamiento de cuadrados finalizado: %d registro(s) actualizados.", n)
             finally:
                 admin.desconectar()
+        try:
+            n_cf = lector.aplicar_regla_cruce_faltante_sobrante_gestion_pendientes(fecha=fecha_usar, hoja_gestion=None)
+            if n_cf:
+                logger.info("Regla cruce faltante-sobrante en gestión: %d cajero(s).", n_cf)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla cruce faltante-sobrante en gestión: %s", e)
         return
 
     # Si solo se pide verificar saldo, ejecutar solo eso y salir (solo filas con Fecha descarga arqueo = fecha_usar)
@@ -246,6 +252,18 @@ def main(
         except Exception as e:
             logger.warning("No se pudo aplicar regla grabar sobrante en gestión: %s", e)
 
+        # Contabilización cuenta faltantes 168710093 en ARQUEOS MF → misma familia que texto gestión MF (faltante residual).
+        try:
+            n_gf = lector.aplicar_regla_grabar_faltante_desde_arqueos_mf(
+                fecha=fecha_usar,
+                hoja_gestion=None,
+                hoja_arqueos_mf=0,
+            )
+            if n_gf:
+                logger.info("Regla grabar faltante 168710093 aplicada: %d registro(s) modificados en gestión.", n_gf)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla grabar faltante 168710093 en gestión: %s", e)
+
         # NUEVA REGLA: sincronizar Gestión (ARQUEO) con "ACLARAR DIFERENCIA Y REPETIR EL ARQUEO"
         try:
             modificados = lector.aplicar_regla_arqueo_espera_aclarar_sucursal(fecha=fecha_usar, hoja_gestion=None, hoja_arqueos_mf=0)
@@ -277,6 +295,30 @@ def main(
                 logger.info("Regla DIARIO sobrante bajo sin ARQUEO: %d fila(s) en gestión.", n_sb)
         except Exception as e:
             logger.warning("No se pudo aplicar regla DIARIO sobrante bajo sin ARQUEO: %s", e)
+
+        # DIARIO con faltante y sin calificación previa: espera de arqueo (antes del cruce faltante-sobrante).
+        try:
+            n_fa = lector.aplicar_regla_diario_faltante_espera_arqueo(fecha=fecha_usar, hoja_gestion=None)
+            if n_fa:
+                logger.info("Regla DIARIO faltante espera arqueo aplicada: %d fila(s) en gestión.", n_fa)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla DIARIO faltante espera arqueo: %s", e)
+
+        # Cruce faltante-sobrante (NUMDOC): datos desde procesar_cuadrados (antes de la regla catch-all final).
+        try:
+            n_cf = lector.aplicar_regla_cruce_faltante_sobrante_gestion_pendientes(fecha=fecha_usar, hoja_gestion=None)
+            if n_cf:
+                logger.info("Regla cruce faltante-sobrante en gestión: %d cajero(s).", n_cf)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla cruce faltante-sobrante en gestión: %s", e)
+
+        # Última regla: solo DIARIO en gestión (sin ARQUEO) con sobrante y sin calificación previa.
+        try:
+            n_ult = lector.aplicar_regla_diario_solo_sobrante_espera_arqueo_ultima(fecha=fecha_usar, hoja_gestion=None)
+            if n_ult:
+                logger.info("Regla última DIARIO solo sobrante (espera arqueo): %d fila(s) en gestión.", n_ult)
+        except Exception as e:
+            logger.warning("No se pudo aplicar regla última DIARIO solo sobrante: %s", e)
         return
 
     try:
